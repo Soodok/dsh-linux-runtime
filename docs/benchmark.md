@@ -1,119 +1,160 @@
-# 性能测量方法与数据
+# 性能数据与测量方法
 
-## 测量纪律（这几条都是踩出来的）
+## 一、测量纪律
 
-1. **在设备内计时**，不要用 adb 往返 —— 协议开销会淹没毫秒级差异。
-2. **不要用 shell 循环计时**。`/proc/uptime` 精度受 `HZ=100` 限制（10ms 粒度），
+这几条都是踩出来的，**这个项目踩过最大的坑不是实现，是测错了方向**。
+
+1. **在设备内计时**。adb 往返的协议开销会淹没毫秒级差异。
+2. **不要用 shell 循环计时**。`/proc/uptime` 精度受 `HZ=100` 限制（10 ms 粒度）；
    容器内 busybox 的 `date` **不支持 `%N`**（`date +%s%N` 只输出秒）。
-   正确做法：**批 N 次求总时再平均**，或程序内 `clock_gettime(CLOCK_MONOTONIC)`。
-3. **基线必须验证「真的跑成功」**。我曾用「宿主直接跑 `cd $R && ./bin/busybox`」
-   当基线得 11ms，宣称「慢 7~9 倍」—— 那个 baseline 是假的：bionic 链接器跑不了
-   musl 二进制，11ms 只是失败命令的耗时。
-4. **异常好的结果先当可疑**。首次测 PRoot 启动得 2~3ms，差点当成「PRoot 更快」，
+   正确做法：批 N 次求总时再平均，或程序内 `clock_gettime(CLOCK_MONOTONIC)`。
+3. **基线必须验证「真的跑成功」**。曾用「宿主直接跑 `cd $R && ./bin/busybox`」
+   当基线得 11 ms，宣称「慢 7~9 倍」—— 那个 baseline 是假的：bionic 链接器跑不了
+   musl 二进制，11 ms 只是失败命令的耗时。
+4. **异常好的结果先当可疑**。首次测 PRoot 启动得 2~3 ms，差点当成「PRoot 更快」，
    加退出码检查发现全是 `rc=127`（exec 失败）。
-5. **交替轮次取最小值/中位数**，不要所有 A 跑完再所有 B —— 设备会热、会限频。
+5. **交替轮次取中位/最优**，不要所有 A 跑完再所有 B —— 设备会热、会限频。
 6. **杀净旧进程**。`pidof app.dsh.mobile` 杀不死，需反复 `kill -9` 到 `ps` 为空；
    端口判就绪只认 `LISTEN` 且核对监听者 PID（`netstat | grep 3080` 会匹配到
    TIME_WAIT 残留行，给出假数据）。
 
-## 基准代码
+## 二、基准程序
 
-进程内自计时，输出 `key=value` 便于脚本解析：
+[`bench/bench_full.c`](../bench/bench_full.c)：7 维，程序内自计时，输出 `key=value`。
 
-```c
-// bench_full.c 摘要
-#define CLOCK CLOCK_MONOTONIC
-static double now_ms(void) {
-    struct timespec ts; clock_gettime(CLOCK, &ts);
-    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
-}
-// exec:   fork + execv("/bin/true") + waitpid
-// io:     open+read+close，300 轮
-// stat:   600 轮
-// getpid: 6000 轮
-// cpu:    2000 万次 sqrt 累加（零 syscall）
-// dir:    readdir 遍历 /usr/bin
-// write:  write 到 /dev/null
-```
+| 维度 | 内容 |
+|---|---|
+| `exec` | `fork` + `execl("/bin/true")` + `waitpid`，一轮 |
+| `io` | `open` + `read` + `close` 同一文件 |
+| `stat` | `stat("/etc/passwd")` |
+| `getpid` | 纯 syscall，不经路径翻译 |
+| `cpu` | 2000 万次浮点除法累加（零 syscall） |
+| `dir` | `readdir` 遍历 `/usr/bin` |
+| `write` | `open(O_TRUNC)` + `write` + `close` |
 
-## 原始数据
+每一维都输出 `*_fail` 计数；**fail 必须为 0 才采信该轮**。
 
-设备：OPPO PLZ110 / Android 16 / 骁龙 8 Elite / 8 核（厂商限频在 ~55%，
-所以绝对值偏保守；同一轮内三方对比仍然有效）。
+## 三、与 PRoot 的逐项对比
 
-### syscall 级（µs/次，5 轮交替取中位）
+条件：同设备、同 rootfs、同脚本、`rounds=500`、3 轮取中位。
 
-| 操作 | 原生 chroot | dsh_alpine | PRoot |
-|---|---|---|---|
-| getpid | 0.002* | 0.27 | 0.39 |
-| stat | 1.9~2.4 | 2.7~3.6 | 3.2~4.4 |
-| open+read+close | — | 11.6 | 7.1 |
-| readdir（603 项） | — | 285.7 | 257.7 |
+| 指标 | dsh_alpine | PRoot 5.1.107 | 倍率 |
+|---|---:|---:|---:|
+| `exec` | **1.46 ms** | 2.76 ms | 1.89× |
+| `io` | **0.009 ms** | 0.19 ms | 21× |
+| `stat` | **0.0037 ms** | 0.10 ms | 27× |
+| `write` | **0.0089 ms** | 0.22 ms | 25× |
+| `dir`（2025 项） | **0.082 ms** | 0.56 ms | 6.8× |
+| `getpid` | 0.00023 ms | 0.00046 ms | 2× |
+| `cpu` | 0.0045 ms | 0.0075~0.16 ms | 1.7~35× |
 
-\* 原生无过滤器，getpid 直接进内核。
+所有 `*_fail` = 0，`dir_entries` 双方一致（1012500 / 2025000）。
 
-### 批量（ms）
+> `exec` 一项受系统负载影响明显（同一实现跨轮次可差 2×）。上表取 3 轮中位；
+> 交替跑 6 轮时 dsh_alpine 有 5 轮胜出。
 
-| 操作 | 原生 chroot | dsh_alpine | PRoot |
-|---|---|---|---|
-| fork+exec+wait ×60 | 0.65~0.79 | 0.97~1.26 | **6.28~8.69** |
-| 文件 IO ×20000 | 62 | 116~164 | **4104~4920** |
-| CPU（2000 万次 sqrt） | 101~110 | 124~133 | 105~133 |
+## 四、三方对照（含 root 基线）
 
-### 真实负载
+### 4.1 启动耗时
 
-| 负载 | dsh_alpine | PRoot | 倍数 |
-|---|---|---|---|
-| SQLite 3.54.1 `-O2` 编译 | **38.6 s** | 49.2 s | 1.27× |
-| SQLite 全量链接 | **47.7 s** | 51.3 s | 1.08× |
-| 30 个 .c 编译+链接 | **1.27~1.40 s** | 2.50~4.23 s | 1.8~3.3× |
-| git 40 次 commit | **1.17 s** | 3.20 s | 2.7× |
-| tar 打包 300 文件 | **0.05 s** | 0.23 s | 4.6× |
-| cp 300 文件 | **0.65 s** | 1.80 s | 2.8× |
+绝对路径、`rc=0`、3 轮取最优：
 
-**产物一致性**：SQLite `-O0` / `-O2` 产物 sha256 与 chroot 侧完全相同
-（`7a6bace197c4` / `515bba8fdb83`）—— 编译结果可复现。
+| 程序 | 真 chroot（root） | dsh_alpine（非 root） | PRoot（非 root） |
+|---|---:|---:|---:|
+| `python3 -c pass` | 18.1 ms | **17.1 ms** | 43.8 ms |
+| `node -e 0` | 44.3 ms | 111.5 ms | 44.9 ms |
+| `git --version` | 1.1 ms | 6.8 ms | 2.3 ms |
+| `gcc --version` | 1.1 ms | 6.8 ms | 2.3 ms |
+| `sqlite3` | 1.3 ms | 7.4 ms | 3.1 ms |
+| `cmake --version` | 10.2 ms | 31.2 ms | 31.1 ms |
 
-### 启动
+### 4.2 文件 IO / syscall
+
+2 万次 `open+read+close` / 20 万次 `getpid`：
+
+| 组 | 文件 IO | syscall |
+|---|---:|---:|
+| 真 chroot（root） | 62 ms | 32 ms |
+| **dsh_alpine（非 root）** | **116~164 ms** | **34~35 ms** |
+| PRoot（非 root） | **4104~4920 ms** | 91~96 ms |
+
+→ 文件 IO 比 PRoot 快约 **30 倍**，syscall 快 **2.7×**，CPU 运算持平。
+
+### 4.3 单次 exec 的优化过程
+
+| 阶段 | 单次 exec | 说明 |
+|---|---:|---|
+| 初始版本 | 11.92 ms | interp 每次重读 723 KB + guest ELF `read`+`memcpy` + 8 MB 栈 |
+| + interp 缓存 | 10.19 ms | musl ld 内容不变，首次读入后复用 |
+| + guest ELF 文件映射 | 8.15 ms | `PROT_READ|MAP_PRIVATE` 直接映射，去掉 memcpy |
+| + 栈 8 MB→2 MB | **4.72 ms** | 实测 guest 极少用超 2 MB |
+| 真 chroot 基线 | 0.73 ms | 无任何拦截 |
+
+> 进一步尝试「execve 不 fork、进程内 reload」能降到 3.64 ms，但会破坏多进程管道
+> （`ABC|gzip|zcat` 全部段错误），**不采用**。栈降到 2 MB 后小数据管道偶发失败，
+> 实际部署保留 4~8 MB。
+
+分阶段打点（打点版）：
 
 | 阶段 | 耗时 |
 |---|---|
-| 进容器执行一条空命令 | 2.4 ms（chroot 1.6 ms，PRoot 19~33 ms） |
-| `node -e 0` | 74 ms（容器层） |
-| 完整引擎 web 就绪 | ≈1430 ms（其中容器层仅 5%，86% 是引擎加载插件） |
+| interp 装载（723 KB） | 906~2094 µs ← **总开销的 70%** |
+| guest ELF 装载（919 KB） | 230~530 µs |
+| 栈 `mmap`（2 MB） | 75~111 µs |
+| 其余（handler 往返 / 路径翻译 / fork） | 约 7 ms（未细分） |
 
-### 内存
+## 五、真实负载
+
+| 负载 | dsh_alpine | PRoot | 倍率 |
+|---|---:|---:|---:|
+| SQLite 3.54.1 `-O2` 编译（271131 行） | **38.6 s** | 49.2 s | 1.27× |
+| SQLite `-O0` 编译 | 8.23 s | 8.24 s | 持平 |
+| SQLite 全量链接 | **47.7 s** | 51.3 s | 1.08× |
+| 30 个 `.c` 编译 + 链接 | **1.27~1.40 s** | 2.50~4.23 s | 1.8~3.3× |
+| `git` 40 次 commit | **1.17 s** | 3.20 s | 2.7× |
+| `tar` 解压 3.9 MB | **0.20 s** | 0.76 s | 3.8× |
+| `tar` 打包 300 文件 | **0.05 s** | 0.23 s | 4.6× |
+| `cp` 300 文件 | **0.65 s** | 1.80 s | 2.8× |
+
+**产物一致性**：SQLite 编译产物 sha256 与 chroot 侧完全相同
+（`-O0` → `7a6bace197c4`，`-O2` → `515bba8fdb83`）。
+
+## 六、内存
 
 | 对象 | VmRSS |
-|---|---|
-| 容器 loader 进程 | 1836 kB |
+|---|---:|
+| 容器 loader 进程本身 | **1836 kB** |
 | 宿主原生 `sh` | 5396 kB |
-| 容器内 Python 启动 | 8172 kB（chroot 7224 kB，差 +948 kB） |
-| 容器内 DSH 引擎 | 171 MB（原生模式 235 MB） |
+| 容器内 Python 启动 | 8172 kB（chroot 7224 kB） |
+| 容器内 Python + numpy 400×400 | 36836 kB（chroot 34288 kB，+7.4%） |
 
-**容器层固定开销 ≈ 0.8~1.0 MB**；分配 200MB 大内存时容器与 chroot 差 +820 kB，
-**无放大**。`VmSize` 里 2GB+ 是固定基址的保留映射，不是实占。
+- 分配 200 MB 大内存：容器 212844 kB vs chroot 212024 kB，**差 +820 kB，无放大**
+- `VmSize` 显示 2 GB+ 是固定基址 `0x7000000000` 的保留映射，**不是实占**
 
-### 硬件 GPU（bionic 进程级桥）
+## 七、硬件 GPU
 
-同一程序、同参数（10000 三角形 ×20 帧 @1024²）：
+同一程序同参数（10000 三角形 × 20 帧 @ 1024²）：
 
-| 后端 | 每帧 |
-|---|---|
-| Adreno 840（硬件） | **0.74~1.76 ms** |
-| llvmpipe（软件） | 26.3~30.5 ms |
+| 后端 | 总计 | 每帧 |
+|---|---:|---:|
+| Adreno 840（硬件，经 bionic 桥） | **14.9 ms** | **0.74~1.76 ms** |
+| llvmpipe（软件，mesa） | 525.9 ms | 26.3~30.5 ms |
 
 差 **35×**。`glReadPixels` 1024²×10：硬件 1.4~2.2 ms（1792~2862 MB/s）。
 
-## 怎么复现
+## 八、复现
 
 ```bash
-# 设备侧
-adb push bench_full.c /data/local/tmp/
-adb shell "su -c 'chmod 644 /data/local/tmp/bench_full.c'"
-# 容器内编译
+# 1. 推基准源码进 rootfs
+cp bench/bench_full.c /data/data/<pkg>/files/linux/distros/alpine/tmp/
+
+# 2. 容器内编译
 dsh_alpine --dsh-reexec-v1 --rootfs $R --interp /lib/ld-musl-aarch64.so.1 \
-  --guest /usr/bin/gcc /usr/bin/gcc -O2 -o /tmp/bench /tmp/bench_full.c
-# 跑（rounds 越大越稳）
-dsh_alpine ... --guest /tmp/bench /tmp/bench 300
+  --guest /usr/bin/gcc /usr/bin/gcc -O2 -o /tmp/bench_full /tmp/bench_full.c
+
+# 3. 跑（rounds 越大越稳，500 约需 1 分钟）
+dsh_alpine --dsh-reexec-v1 --rootfs $R --interp /lib/ld-musl-aarch64.so.1 \
+  --guest /tmp/bench_full /tmp/bench_full 500
+
+# 4. PRoot 侧同参数跑同一份二进制，交替 3~5 轮取中位
 ```

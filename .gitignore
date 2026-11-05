@@ -1,0 +1,6 @@
+# 编译产物（源码入库，产物按需本地生成；如需发布 release 用 build/ 目录）
+/build/libdsh_alpine.so
+
+# 临时
+*.o
+*.tmp

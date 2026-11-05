@@ -1,0 +1,120 @@
+DSH Linux Runtime — Proprietary License
+========================================
+
+Copyright (c) 2026 Soodok. All rights reserved.
+All rights reserved.
+
+This software and its source code (the "Software") are proprietary and
+confidential. They are NOT open source and are NOT licensed under any
+open-source license.
+
+--------------------------------------------------------------------------------
+1. GRANT
+--------------------------------------------------------------------------------
+
+Subject to the restrictions in Section 2, you are permitted, without payment
+or written agreement, to:
+
+  (a) read, study and quote the Software for the purpose of understanding
+      how it works, reviewing it, or discussing it in issues and pull
+      requests of the official project repositories;
+
+  (b) compile and run the Software solely as part of an unmodified official
+      build of the DSH Mobile application distributed by the copyright
+      holder;
+
+  (c) reproduce and publish benchmark results measured with the Software,
+      provided you state the source and do not present them as results of
+      a different implementation.
+
+--------------------------------------------------------------------------------
+2. RESTRICTIONS
+--------------------------------------------------------------------------------
+
+Except as expressly permitted in Section 1, or with prior written permission
+from the copyright holder, you may NOT:
+
+  (a) copy, modify, merge, publish, distribute, sublicense, sell, rent, lease
+      or otherwise make the Software available, in whole or in part, in source
+      or binary form;
+
+  (b) incorporate the Software, or any derivative work of it, into another
+      product, service, application, operating system, container runtime,
+      emulator, compatibility layer, or cloud offering;
+
+  (c) use the Software to build a competing product or to provide a hosted
+      or commercial service;
+
+  (d) remove, obscure, or alter this license, any copyright notice, or any
+      authorship attribution contained in the Software;
+
+  (e) reverse engineer the Software for the purpose of extracting its
+      implementation into an independent codebase, except where such
+      restriction is prohibited by applicable law.
+
+--------------------------------------------------------------------------------
+3. NO TRADEMARK RIGHTS
+--------------------------------------------------------------------------------
+
+This license does not grant any rights to use the trade names, trademarks,
+service marks, or product names of the copyright holder, except as required
+for reasonable and customary use in describing the origin of the Software.
+
+--------------------------------------------------------------------------------
+4. THIRD-PARTY CODE
+--------------------------------------------------------------------------------
+
+The Software is an independent, from-scratch implementation. It contains no
+code from TAWC/tawcroot, PRoot, QEMU, LXC, or any other third-party project.
+
+TAWC (wmww/tawc) is licensed under GPL-3.0. Only its public documentation was
+consulted to understand design constraints. Under no circumstances may code
+from any GPL-licensed project be introduced into this Software: doing so would
+subject this proprietary code to GPL-3.0 and void this license.
+
+Contributors must not submit code copied from GPL, AGPL, or any other
+reciprocal-licensed project.
+
+--------------------------------------------------------------------------------
+5. CONTRIBUTIONS
+--------------------------------------------------------------------------------
+
+By submitting a contribution (patch, pull request, or any other form) to this
+project, you agree to assign to the copyright holder all right, title and
+interest in that contribution, including all copyright, and you confirm that
+you have the legal right to do so.
+
+You also confirm that your contribution contains no third-party code unless
+its license is compatible with this proprietary license and the incompatibility
+is disclosed in the pull request.
+
+--------------------------------------------------------------------------------
+6. NO WARRANTY
+--------------------------------------------------------------------------------
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+7. TERMINATION
+--------------------------------------------------------------------------------
+
+This license terminates automatically if you breach any of its terms. Upon
+termination you must cease all use of the Software and destroy all copies in
+your possession or control.
+
+--------------------------------------------------------------------------------
+8. CONTACT
+--------------------------------------------------------------------------------
+
+For licensing inquiries, permissions, or commercial use:
+  https://github.com/Soodok/Deepseek-Harness-Local-Android/issues
+
+--------------------------------------------------------------------------------
+
+SPDX-License-Identifier: LicenseRef-Proprietary

@@ -1,0 +1,44 @@
+NOTICE
+======
+
+DSH Linux Runtime — Proprietary software.
+Copyright (c) 2026 Soodok. All rights reserved.
+See LICENSE for terms.
+
+--------------------------------------------------------------------------------
+独立实现声明
+--------------------------------------------------------------------------------
+
+本仓库的 src/dsh_alpine.c 是**从零手写的独立实现**，不含以下任何项目的代码：
+
+  · TAWC / tawcroot (wmww/tawc) — GPL-3.0
+  · PRoot (termux/proot) — GPL-2.0
+  · QEMU — GPL-2.0
+  · LXC / LXD — LGPL-2.1
+  · termux-exec / termux-packages 的补丁
+  · Android NDK 的 crt 与 libc 源码
+
+仅**阅读**过 TAWC 的公开文档以理解设计约束（例如「静态链接 + 固定基址让 IP
+白名单跨 re-exec 生效」这一前提）。文档是事实性描述，不构成衍生作品。
+
+**任何 GPL/AGPL 代码都不得引入本仓库** —— 一旦引入，本文件的专有许可即被
+GPL-3.0 覆盖，整个条款失效。贡献者提交前请确认代码来源。
+
+--------------------------------------------------------------------------------
+参考的公开资料（非代码）
+--------------------------------------------------------------------------------
+
+  · Linux 内核 Documentation/userspace-api/seccomp_filter.rst
+  · Linux 内核 Documentation/admin-guide/binfmt-misc.rst
+  · man 2 seccomp / ptrace / execveat / clone
+  · "Procedure Call Standard for the Arm 64-bit Architecture" (Arm Ltd.)
+  · musl libc 源码中的 src/network/res_msend.c（用于理解 resolver 端口硬编码行为）
+  · Alpine Linux 与 Ubuntu 的 rootfs 结构公开文档
+
+--------------------------------------------------------------------------------
+构建工具链
+--------------------------------------------------------------------------------
+
+构建产物链接 Android NDK 提供的编译期运行时启动代码（crtbegin_static.o 等）。
+这些文件的许可为 Apache-2.0 WITH LLVM-exception 或 NDK 自身的 NOTICE 条款，
+与最终产物一起分发属于正常使用，不影响本仓库源码的专有许可。

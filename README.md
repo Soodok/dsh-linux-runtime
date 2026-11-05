@@ -1,7 +1,14 @@
 # DSH Linux Runtime
 
-**专有软件 / Proprietary software** — 许可条款见 [LICENSE](./LICENSE)，非开源。
-**请勿**假设你可以像 MIT/Apache 项目那样复制、修改或再分发本仓库的任何部分。
+> ## ⚠️ 专有软件 / PROPRIETARY
+>
+> 本仓库**不是开源项目**。代码公开是**为了可审查、可讨论**，不是放弃权利。
+>
+> **可以**：阅读、学习、在 issue/PR 中引用讨论、随官方 App 编译运行、
+> 复现性能数据（注明出处）。
+> **不可以**：复制、修改、再分发、并入其他产品或做竞品、去除本声明。
+>
+> 完整条款见 [LICENSE](./LICENSE)（正本）。商用授权请开 issue。
 
 在 Android 上**免 root** 运行完整 Linux 用户态（glibc / musl 均可）的容器运行器。
 不走 ptrace、不需要 user namespace、不需要 chroot、不需要解锁 BL 或刷 Magisk。

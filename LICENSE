@@ -1,118 +1,371 @@
 DSH Linux Runtime — Proprietary License
 ========================================
 
+Version 1.0 — effective 2026-11-05
+
 Copyright (c) 2026 Soodok. All rights reserved.
-All rights reserved.
 
-This software and its source code (the "Software") are proprietary and
-confidential. They are NOT open source and are NOT licensed under any
-open-source license.
-
---------------------------------------------------------------------------------
-1. GRANT
---------------------------------------------------------------------------------
-
-Subject to the restrictions in Section 2, you are permitted, without payment
-or written agreement, to:
-
-  (a) read, study and quote the Software for the purpose of understanding
-      how it works, reviewing it, or discussing it in issues and pull
-      requests of the official project repositories;
-
-  (b) compile and run the Software solely as part of an unmodified official
-      build of the DSH Mobile application distributed by the copyright
-      holder;
-
-  (c) reproduce and publish benchmark results measured with the Software,
-      provided you state the source and do not present them as results of
-      a different implementation.
+中文译本见 LICENSE.zh-CN.md（仅供参考，如有歧义以本文英文为准）。
+A Chinese translation is provided in LICENSE.zh-CN.md for convenience only;
+in case of any discrepancy, this English text prevails.
 
 --------------------------------------------------------------------------------
-2. RESTRICTIONS
+0. DEFINITIONS
 --------------------------------------------------------------------------------
 
-Except as expressly permitted in Section 1, or with prior written permission
+"Software" means the source code, object code, binaries, schema files,
+generated artifacts (including BPF filter tables), documentation and any other
+material in this repository, together with all modifications, translations,
+adaptations and Derivative Works of any of them.
+
+"Derivative Work" has the meaning given in Article 2 of the Berne Convention
+and Section 101 of the U.S. Copyright Act, and additionally includes, without
+limitation: (a) any work that incorporates, links against, subclasses,
+wraps, patches or otherwise reuses any part of the Software; (b) any
+translation into another programming language; (c) any reimplementation
+produced by extracting design decisions from the Software rather than from
+independent public sources.
+
+"Official Build" means a binary produced by the copyright holder, or produced
+by you by compiling an unmodified copy of this repository with the build
+procedure documented in build/build.sh.
+
+"You" means the individual or legal entity exercising rights under this
+license, and any entity that controls, is controlled by, or is under common
+control with that entity.
+
+"Commercial Use" means any use by, for, or on behalf of an entity in
+connection with a product or service from which that entity derives revenue,
+directly or indirectly, including internal production use.
+
+--------------------------------------------------------------------------------
+1. RESERVATION OF RIGHTS
+--------------------------------------------------------------------------------
+
+The Software is proprietary. It is NOT open source and is NOT offered under
+any open-source license. No rights are granted to you except those expressly
+stated in Section 2.
+
+All rights not expressly granted are reserved by the copyright holder,
+including the rights to reproduce, prepare Derivative Works of, publicly
+display, publicly perform, sublicense and distribute the Software, and to
+grant licenses on any terms.
+
+No license or right is granted by implication, estoppel, exhaustion or
+otherwise. The fact that this repository is publicly readable does not
+constitute a waiver of any right, nor an offer of any license beyond Section 2.
+Where a hosting platform's terms of service permit you to view or fork a public
+repository, those terms do not grant you any right to use the Software beyond
+Section 2 of this license.
+
+--------------------------------------------------------------------------------
+2. LIMITED PERMISSIONS
+--------------------------------------------------------------------------------
+
+Subject to full compliance with Section 3, and provided that you do not fall
+within any category listed in Section 3.1, you may, without payment or written
+agreement:
+
+  (a) VIEW AND STUDY the Software, and quote limited excerpts of it in issues,
+      pull requests, bug reports, security advisories, academic publications
+      and technical articles, for the purpose of discussing or describing the
+      Software, provided you attribute the source and link to this repository.
+      Quoting must be limited to what is necessary for the discussion; it must
+      not amount to reproducing a substantial portion of the Software.
+
+  (b) BUILD the Software from an unmodified copy of this repository, using the
+      documented build procedure, and RUN the resulting binary for your own
+      personal, non-commercial purposes, or for the purpose of evaluating the
+      Software with a view to obtaining a commercial license.
+
+  (c) RUN an Official Build, including as embedded in the DSH Mobile
+      application distributed by the copyright holder.
+
+  (d) REPRODUCE AND PUBLISH benchmark results, performance measurements and
+      security analyses obtained from running the Software, provided you state
+      that the results were obtained with "DSH Linux Runtime", link to this
+      repository, and do not attribute the results to a different
+      implementation or present them as your own work.
+
+  (e) SUBMIT contributions to this repository in accordance with Section 6.
+
+These permissions are non-exclusive, non-transferable, non-sublicensable,
+revocable per Section 12, and limited to the term of the copyright.
+
+--------------------------------------------------------------------------------
+3. PROHIBITED USES
+--------------------------------------------------------------------------------
+
+Except as expressly permitted in Section 2, or with prior written permission
 from the copyright holder, you may NOT:
 
-  (a) copy, modify, merge, publish, distribute, sublicense, sell, rent, lease
-      or otherwise make the Software available, in whole or in part, in source
-      or binary form;
+  (a) COPY, reproduce, mirror, or store the Software, in whole or in
+      substantial part, outside of your own working copy made for the purposes
+      of Section 2(a) or 2(b);
 
-  (b) incorporate the Software, or any derivative work of it, into another
-      product, service, application, operating system, container runtime,
-      emulator, compatibility layer, or cloud offering;
+  (b) MODIFY, adapt, translate, or create Derivative Works of the Software,
+      except for changes made locally and solely for your own use under
+      Section 2(b), and except for contributions submitted under Section 6;
 
-  (c) use the Software to build a competing product or to provide a hosted
-      or commercial service;
+  (c) DISTRIBUTE, publish, sublicense, sell, rent, lease, lend, upload to any
+      package registry, app store, container registry, model hub, or otherwise
+      make the Software available to any third party, in source or binary
+      form, in whole or in part;
 
-  (d) remove, obscure, or alter this license, any copyright notice, or any
-      authorship attribution contained in the Software;
+  (d) INCORPORATE the Software, or any Derivative Work of it, into another
+      product, service, application, library, SDK, operating system, container
+      runtime, emulator, compatibility layer, distribution image, firmware, or
+      cloud offering;
 
-  (e) reverse engineer the Software for the purpose of extracting its
-      implementation into an independent codebase, except where such
-      restriction is prohibited by applicable law.
+  (e) PROVIDE THE FUNCTIONALITY OF THE SOFTWARE TO THIRD PARTIES as a service,
+      including as a hosted runtime, a sandboxing or containerization backend,
+      a managed build environment, or a remote execution service;
+
+  (f) USE THE SOFTWARE, OR ANY PART OF IT, AS TRAINING DATA, FINE-TUNING DATA,
+      EVALUATION DATA, OR AS INPUT TO ANY MACHINE LEARNING OR GENERATIVE AI
+      SYSTEM, or for the purpose of benchmarking, distilling or reproducing its
+      behaviour in another system;
+
+  (g) USE THE SOFTWARE TO DEVELOP, TEST OR BENCHMARK A COMPETING PRODUCT, or to
+      derive design decisions for an independent reimplementation;
+
+  (h) CIRCUMVENT any technical or contractual restriction, including by
+      extracting the Software through reverse engineering, decompilation,
+      disassembly, or by obtaining it from a third party who was not permitted
+      to disclose it, except where such restriction is expressly prohibited by
+      applicable law;
+
+  (i) REMOVE, OBSCURE, OR ALTER this license, any copyright notice, any
+      authorship attribution, or any notice of proprietary status contained in
+      or accompanying the Software;
+
+  (j) ASSIGN, TRANSFER, SUBLICENSE, OR OTHERWISE DELEGATE your rights under
+      this license to any third party, or permit any third party to use your
+      working copy.
 
 --------------------------------------------------------------------------------
-3. NO TRADEMARK RIGHTS
+3.1 COMMERCIAL USE REQUIRES A SEPARATE LICENSE
 --------------------------------------------------------------------------------
 
-This license does not grant any rights to use the trade names, trademarks,
-service marks, or product names of the copyright holder, except as required
-for reasonable and customary use in describing the origin of the Software.
+No permission in Section 2 extends to Commercial Use. Any Commercial Use,
+including internal production use by an entity, requires a separate written
+license from the copyright holder. Evaluation under Section 2(b) does not
+require a commercial license, but ceases to be permitted once the Software is
+put into Commercial Use.
 
 --------------------------------------------------------------------------------
-4. THIRD-PARTY CODE
+4. THIRD-PARTY CODE AND COPYLEFT COMPATIBILITY
 --------------------------------------------------------------------------------
 
 The Software is an independent, from-scratch implementation. It contains no
-code from TAWC/tawcroot, PRoot, QEMU, LXC, or any other third-party project.
+code from TAWC/tawcroot, PRoot, QEMU, LXC, Termux patches, or any other
+third-party project. Public kernel documentation, ABI specifications and
+language-standard documents were consulted; none of them constitutes
+copyrightable software.
 
-TAWC (wmww/tawc) is licensed under GPL-3.0. Only its public documentation was
-consulted to understand design constraints. Under no circumstances may code
-from any GPL-licensed project be introduced into this Software: doing so would
-subject this proprietary code to GPL-3.0 and void this license.
+TAWC (wmww/tawc) is licensed under GPL-3.0. Its public documentation may be
+consulted, but no code may be copied from it or from any other project under
+GPL-2.0, GPL-3.0, AGPL, LGPL, MPL, EPL, CDDL, or any other reciprocal or
+copyleft license.
 
-Contributors must not submit code copied from GPL, AGPL, or any other
-reciprocal-licensed project.
+Because this license grants no right to distribute the Software, no combination
+of the Software with a copyleft component can be created by you in a manner
+permitted by this license. Attempting to do so is not authorised by this
+license; any distribution of such a combination is outside the scope of this
+license and is your sole responsibility.
 
---------------------------------------------------------------------------------
-5. CONTRIBUTIONS
---------------------------------------------------------------------------------
-
-By submitting a contribution (patch, pull request, or any other form) to this
-project, you agree to assign to the copyright holder all right, title and
-interest in that contribution, including all copyright, and you confirm that
-you have the legal right to do so.
-
-You also confirm that your contribution contains no third-party code unless
-its license is compatible with this proprietary license and the incompatibility
-is disclosed in the pull request.
+Contributors must not submit code copied from any reciprocally-licensed
+project. Doing so is a breach of Section 6 and may also create obligations for
+the contributor under that project's license.
 
 --------------------------------------------------------------------------------
-6. NO WARRANTY
+5. TRADEMARKS
+--------------------------------------------------------------------------------
+
+This license grants no rights to the trade names, trademarks, service marks,
+logos, or product names of the copyright holder. Reasonable and customary use
+in describing the origin of the Software is permitted; use of the names to
+endorse or promote a third-party product or service requires written
+permission.
+
+--------------------------------------------------------------------------------
+6. CONTRIBUTIONS
+--------------------------------------------------------------------------------
+
+By submitting a contribution (patch, pull request, issue comment containing
+code, or any other form) to this repository, you:
+
+  (a) represent and warrant that you are the sole author of the contribution,
+      or that you have all rights necessary to grant the rights below, and that
+      the contribution contains no third-party code except as fully disclosed
+      in the pull request together with its license;
+
+  (b) assign to the copyright holder all right, title and interest in the
+      contribution, including all copyright and all rights to sue for past,
+      present and future infringements;
+
+  (c) to the extent that any such assignment is ineffective or unenforceable
+      under applicable law, grant the copyright holder a perpetual,
+      worldwide, irrevocable, royalty-free, fully paid-up, sublicensable and
+      transferable license to use, reproduce, modify, prepare Derivative Works
+      of, distribute, publicly display, and otherwise exploit the contribution,
+      under any license terms the copyright holder chooses;
+
+  (d) waive, to the extent permitted by law, any moral rights in the
+      contribution that would prevent the copyright holder from exercising the
+      rights above;
+
+  (e) agree that you receive no compensation, attribution entitlement beyond
+      what the copyright holder may choose to provide, or equity interest.
+
+If you do not accept these terms, do not submit a contribution.
+
+--------------------------------------------------------------------------------
+7. PATENTS
+--------------------------------------------------------------------------------
+
+The copyright holder reserves all patent rights. No patent license, express or
+implied, is granted by this license, by the disclosure of the Software, or by
+any act other than a separate written patent license.
+
+If you institute patent litigation or other proceedings against the copyright
+holder or any user of the Software alleging that the Software infringes a
+patent, all permissions granted to you under Section 2 terminate immediately as
+of the date such proceedings are filed.
+
+--------------------------------------------------------------------------------
+8. NO WARRANTY
 --------------------------------------------------------------------------------
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
-SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
-OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-IN THE SOFTWARE.
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, QUIET ENJOYMENT, ACCURACY AND
+NON-INFRINGEMENT.
+
+The copyright holder does not warrant that the Software is free of defects,
+will operate without interruption, is suitable for any particular purpose, or
+complies with any legal or regulatory requirement applicable to you. You bear
+the entire risk as to the quality and performance of the Software.
 
 --------------------------------------------------------------------------------
-7. TERMINATION
+9. LIMITATION OF LIABILITY
 --------------------------------------------------------------------------------
 
-This license terminates automatically if you breach any of its terms. Upon
-termination you must cease all use of the Software and destroy all copies in
-your possession or control.
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, PUNITIVE OR CONSEQUENTIAL DAMAGES (INCLUDING LOSS OF PROFITS, LOSS
+OF DATA, LOSS OF GOODWILL, BUSINESS INTERRUPTION, DEVICE DAMAGE, DATA LOSS OR
+CORRUPTION, OR THE COST OF PROCURING SUBSTITUTE GOODS OR SERVICES) ARISING OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THIS LICENSE, HOWEVER CAUSED AND
+UNDER ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, TORT OR
+OTHERWISE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+Where liability cannot be excluded, the copyright holder's aggregate liability
+shall not exceed the greater of (i) the amount you paid for the Software, which
+is zero for the permissions in Section 2, and (ii) one hundred (100) US dollars.
+
+Nothing in this license excludes or limits liability for fraud, wilful
+misconduct, death or personal injury caused by negligence, or any other
+liability that cannot be excluded under applicable law.
 
 --------------------------------------------------------------------------------
-8. CONTACT
+10. INDEMNITY
 --------------------------------------------------------------------------------
 
-For licensing inquiries, permissions, or commercial use:
+You agree to indemnify, defend and hold harmless the copyright holder from and
+against any claim, demand, action, proceeding, loss, liability, damage, cost or
+expense (including reasonable legal fees) arising out of or relating to your
+use of the Software in breach of this license, your violation of any law, or
+your infringement of any third-party right.
+
+--------------------------------------------------------------------------------
+11. ASSUMPTION OF RISK — SECURITY
+--------------------------------------------------------------------------------
+
+The Software is NOT a security sandbox. It is a single-process design intended
+to improve performance and compatibility, not to isolate untrusted code.
+
+You acknowledge that code executed inside the runtime environment may be able
+to reach host-level resources, and that running untrusted code with the
+Software is unsafe by design. You are solely responsible for the code you
+execute and for the consequences thereof.
+
+--------------------------------------------------------------------------------
+12. TERM, TERMINATION AND CURE
+--------------------------------------------------------------------------------
+
+This license is effective until terminated.
+
+It terminates AUTOMATICALLY AND IMMEDIATELY, without notice, if you breach any
+term of this license.
+
+In addition, the copyright holder may terminate this license with immediate
+effect if you commence the prohibited action described in Section 7.
+
+On termination you must, within seven (7) days, cease all use of the Software
+and destroy or permanently erase all copies, builds, Derivative Works and
+derived artifacts in your possession or control, and confirm in writing on
+request.
+
+Notwithstanding the foregoing, if the breach is capable of cure and is cured
+within thirty (30) days after you become aware of it, this license is
+reinstated retroactively as of the date of termination, provided you were not
+previously notified of the same breach.
+
+Sections 3, 5, 6, 7, 8, 9, 10, 11, 13, and 14 survive termination.
+
+--------------------------------------------------------------------------------
+13. EXPORT CONTROL AND SANCTIONS
+--------------------------------------------------------------------------------
+
+The Software may be subject to export control and economic sanctions laws. You
+represent that you are not located in, under the control of, or a national or
+resident of any country or territory subject to comprehensive sanctions, and
+that you are not identified on any applicable restricted-party list. You agree
+to comply with all applicable export and import laws and regulations.
+
+--------------------------------------------------------------------------------
+14. GENERAL
+--------------------------------------------------------------------------------
+
+14.1 SEVERABILITY. If any provision of this license is held invalid, illegal or
+unenforceable, that provision shall be modified to the minimum extent
+necessary to make it enforceable, or if modification is not possible, severed;
+the remaining provisions remain in full force and effect.
+
+14.2 NO WAIVER. Failure or delay by the copyright holder in exercising any
+right or remedy does not operate as a waiver, and no single or partial exercise
+precludes any further exercise.
+
+14.3 ENTIRE AGREEMENT. This license is the entire agreement between the parties
+concerning the Software and supersedes all prior or contemporaneous
+understandings, written or oral. It may be amended only by a written document
+signed (or issued in a verifiable electronic form) by the copyright holder.
+
+14.4 THIRD-PARTY BENEFICIARIES. No person other than the copyright holder and
+you has any right to enforce any term of this license.
+
+14.5 GOVERNING LAW. This license is governed by the laws of the People's
+Republic of China, excluding its conflict-of-law rules and the United Nations
+Convention on Contracts for the International Sale of Goods.
+
+14.6 JURISDICTION. The courts located in the copyright holder's place of
+residence in the People's Republic of China have exclusive jurisdiction over
+any dispute arising out of or in connection with this license. Nothing in this
+section prevents the copyright holder from seeking injunctive relief in any
+jurisdiction where an infringement occurs.
+
+14.7 LANGUAGE. This license is executed in English, which is the authoritative
+version. The Chinese translation in LICENSE.zh-CN.md is provided for
+convenience; in case of conflict, the English text prevails.
+
+--------------------------------------------------------------------------------
+15. CONTACT
+--------------------------------------------------------------------------------
+
+Commercial licensing, permissions, and any request to use the Software outside
+Section 2:
+
   https://github.com/Soodok/Deepseek-Harness-Local-Android/issues
 
 --------------------------------------------------------------------------------

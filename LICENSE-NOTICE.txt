@@ -1,0 +1,143 @@
+DSH Linux Runtime
+=================
+
+**PROPRIETARY — NOT OPEN SOURCE.**
+**专有软件 — 不是开源项目。**
+
+Copyright (c) 2026 Soodok. All rights reserved.
+版权所有 (c) 2026 Soodok，保留一切权利。
+
+--------------------------------------------------------------------------------
+
+This repository contains proprietary software. Public visibility is provided
+for review and discussion only. It does NOT grant an open-source license, a
+right to fork for independent use, or any right beyond the narrowly enumerated
+permissions in LICENSE Section 2.
+
+本仓库包含专有软件。公开可读仅为便于审查与讨论，**不**授予开源许可、
+**不**允许 fork 后独立使用、也**不**授予 LICENSE 第 2 条封闭清单之外的任何权利。
+
+--------------------------------------------------------------------------------
+
+WHAT YOU MAY DO WITHOUT PAYING OR SIGNING
+无需付费或签约即可做的事情
+--------------------------------------------------------------------------------
+
+  · Read and study the source.
+    阅读与研究源码。
+
+  · Quote limited excerpts in issues, pull requests, articles and academic
+    papers, with attribution and a link back to this repository.
+    在 issue、PR、文章、论文中引用有限片段，须注明来源并回链本仓库。
+
+  · Build from an unmodified copy using the documented procedure and run the
+    result for personal, non-commercial purposes, or to evaluate whether to
+    obtain a commercial license.
+    用未修改副本按文档流程编译，并用于个人非商业用途，或用于评估是否采购商业许可。
+
+  · Run an official build, including as embedded in the DSH Mobile app.
+    运行官方构建，包括随 DSH Mobile 应用内嵌运行。
+
+  · Reproduce and publish benchmark results, stating the source.
+    复现并发布基准结果，须注明来源。
+
+  · Submit contributions under LICENSE Section 6.
+    按 LICENSE 第 6 条提交贡献。
+
+--------------------------------------------------------------------------------
+
+WHAT YOU MAY NOT DO
+不可以做的事情
+--------------------------------------------------------------------------------
+
+  · Copy, mirror, or store the software in whole or in substantial part.
+    复制、镜像或存储本软件全部或实质部分。
+
+  · Modify or create derivative works, other than changes made locally and
+    solely for your own use.
+    修改或制作衍生作品（仅为你自用而进行的本地改动除外）。
+
+  · Distribute, publish, sublicense, sell, or upload to any registry or store.
+    分发、发布、再许可、出售，或上传至任何仓库或应用商店。
+
+  · Incorporate into another product, service, SDK, OS or runtime.
+    并入其他产品、服务、SDK、操作系统或运行时。
+
+  · Provide its functionality to third parties as a service.
+    以服务形式向第三方提供其功能。
+
+  · Use as training, fine-tuning or evaluation data for any AI system.
+    用作任何 AI 系统的训练、微调或评测数据。
+
+  · Develop, test or benchmark a competing product, or extract its design
+    decisions for an independent reimplementation.
+    开发、测试或基准测试竞争产品，或提取其设计决策用于独立重新实现。
+
+  · Remove or alter this notice or any copyright statement.
+    移除或更改本声明或任何版权声明。
+
+  · Transfer or sublicense your rights to any third party.
+    将你的权利转让或再许可给任何第三方。
+
+--------------------------------------------------------------------------------
+
+COMMERCIAL USE REQUIRES A SEPARATE LICENSE
+商业使用须另行取得许可
+--------------------------------------------------------------------------------
+
+No permission above extends to commercial use, including internal production
+use by an entity. Evaluation does not require a commercial license, but ceases
+to be permitted once the software is put into commercial use.
+
+上述任何许可均不延伸至商业使用，包括主体的内部生产性使用。为评估而使用无需
+商业许可，但软件一经投入商业使用，该评估许可即不再适用。
+
+--------------------------------------------------------------------------------
+
+THIS IS NOT A SECURITY SANDBOX
+本软件不是安全沙箱
+--------------------------------------------------------------------------------
+
+The runtime is a single-process design intended for performance and
+compatibility, not isolation of untrusted code. Code executed inside it may
+reach host-level resources. You are solely responsible for the code you run.
+
+本运行时为单进程设计，目标是性能与兼容性，而非隔离不可信代码。在其内部执行的
+代码可能触及宿主级资源。你对所执行的代码承担全部责任。
+
+--------------------------------------------------------------------------------
+
+NO THIRD-PARTY CODE
+不含第三方代码
+--------------------------------------------------------------------------------
+
+This is an independent, from-scratch implementation. It contains no code from
+TAWC/tawcroot, PRoot, QEMU, LXC, Termux patches, or any other project. Public
+kernel documentation and ABI specifications were consulted; they are not
+copyrightable software.
+
+You must not introduce code from any GPL, AGPL, LGPL, MPL, EPL or CDDL project
+into this repository. Doing so would subject this proprietary code to that
+license and void this license for everyone.
+
+本实现为从零手写，不含 TAWC/tawcroot、PRoot、QEMU、LXC、Termux 补丁或任何其他
+项目的代码。开发中查阅了公开的内核文档与 ABI 规范 —— 它们不构成受版权保护的软件。
+
+不得向本仓库引入任何 GPL、AGPL、LGPL、MPL、EPL、CDDL 项目的代码。这样做会使
+本专有代码受该许可约束，并对所有人void本许可。
+
+--------------------------------------------------------------------------------
+
+FILES
+文件
+--------------------------------------------------------------------------------
+
+  LICENSE            许可正本（英文，权威版本）
+  LICENSE.zh-CN.md   许可中文参考译本（如有歧义以英文为准）
+  NOTICE             独立实现声明与参考资料
+  CONTRIBUTING.md    贡献条款（含版权转让的法律后果，提交前请阅读）
+  README.md          项目说明、性能数据、编译与限制
+
+--------------------------------------------------------------------------------
+
+SPDX-License-Identifier: LicenseRef-Proprietary

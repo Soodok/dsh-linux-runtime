@@ -115,12 +115,14 @@ TAWC 是独立 App + `ando` 命令做桥接 `[官方]`。
    - **已有**：容器内 EGL/GLES 硬件渲染 + 画面回传 App（`lib/dsh_gl` + `LinuxFrameSurface`）；
      容器内 **weston headless compositor 能跑**，真实 Wayland 客户端能建出
      `xdg_toplevel` 顶层窗口（`[实测]` scene-graph 有 `top-level window 'simple-shm'`）。
-   - **本轮新增**：**AHB 零拷贝渲染链路打通**（`[实测]`）——
+   - **本轮新增**：**AHB 渲染路径打通并做过同进程 A/B 对照**（`[实测]`）——
      `AHardwareBuffer` → `EGLClientBuffer` → `EGLImage` → GL texture → FBO
-     colour attachment → GPU 直接渲染进去，CPU 一次回读都不需要。
-     1080p **6.777 ms/帧 → 0.341 ms/帧（19.9 倍）**，像素校验收回
-     `255,89,26,255`（对齐 `glClearColor(1.0,0.35,0.1)`）、FBO COMPLETE。
-     这消掉了旧路径里占 83% 的 `glReadPixels`。
+     colour attachment → GPU 直接渲染进去。
+     像素校验收回 `255,89,26,255`（对齐 `glClearColor(1.0,0.35,0.1)`）、FBO COMPLETE。
+     **同进程 A/B（同二进制/同轮/同上下文，各 60 帧）**：1080p AHB
+     `6.344 ms` vs glReadPixels `10.930 ms` = **1.72 倍**（720p 1.58×、360p 1.35×）。
+     收益来源是「GPU→CPU 取像素」那一段从 8.379 降到 3.954 ms（2.1 倍），
+     不是整体 19.9 倍 —— 那个数曾误用「只渲染」对「渲染+回读」，已改正。
    - **仍缺**：① **compositor 用硬件合成** —— 容器内 weston 走 `pixman`（CPU），
      AHB 那条路目前是「App 自己的 GL 程序用」，还没接进 compositor 的 renderer；
      ② **系统窗口（SurfaceFlinger layer）** —— 需要 app Binder，免 root 拿不到；
@@ -162,7 +164,7 @@ TAWC 多出的是「系统窗口 + 硬件合成 + glibc 生态」这三块大而
 **边界变化**：图形栈的差距经过三轮缩小 ——
 ① 从「我们没有 compositor」→「有 compositor 且真实客户端能建 `xdg_toplevel` 窗口」；
 ② 渲染性能从「必须 glReadPixels 回读、1080p 只能 147 fps」→
-   「AHB 零拷贝直写、1080p 2932 fps（19.9 倍）」；
+   「AHB 渲染路径、1080p 1.72 倍（同进程 A/B 对照）」；
 ③ 剩下的是**把 AHB 接进 compositor 的 renderer** 和 **把 AHB 交给 App 的
    SurfaceTexture** 这两段，路径已经清楚，不是未知。
 

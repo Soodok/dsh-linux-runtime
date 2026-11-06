@@ -1075,20 +1075,21 @@ AHB lock: 4.498 ms
 RESULT: AHB_OK
 ```
 
-三档分辨率实测（模拟器 dsh34 / x86_64 / SwiftShader）：
+三档分辨率实测（模拟器 dsh34 / x86_64 / SwiftShader，**只渲染、不含取像素**）：
 
-| 分辨率 | render into AHB | AHB lock（一次性） |
-|---|---|---|
-| 640×360 | 0.044 ms/帧 | 0.765 ms |
-| 1280×720 | 0.129 ms/帧 | 4.381 ms |
-| 1920×1080 | **0.341 ms/帧** | 4.498 ms |
+| 分辨率 | render into AHB（纯渲染） |
+|---|---|
+| 640×360 | 0.044 ms/帧 |
+| 1280×720 | 0.129 ms/帧 |
+| 1920×1080 | 0.341 ms/帧 |
 
-**与旧路径对比（1080p）**：旧 6.777 ms/帧（render 1.125 + glReadPixels 5.630 +
-write 0.014）→ 新 **0.341 ms/帧**，**19.9 倍**。而且连 render 本身也快了
-（0.341 vs 1.125），因为不再为回读做同步。
-
-`AHB lock` 那 4.5ms 是**一次性**的（App 只在需要把 AHB 交给 SurfaceTexture 时锁），
-不是每帧成本。
+> ⚠️ **不要把上面这张表拿去和「render + glReadPixels」的数字比。**
+> 这里只有渲染，没有 GPU→CPU 取像素那一步，横比会算出 19.9 倍这种假收益
+> （本节初次发布就是这么错的）。真实收益必须用**同进程 A/B** 测：
+> 见 pitfalls #41 与 benchmark 第 14 节 —— 1080p 端到端 **1.72 倍**
+> （AHB 6.344 ms vs glReadPixels 10.930 ms）。
+>
+> `AHB_lock` 也不是一次性的：每次取像素都要 lock 一次，它是每帧成本。
 
 ### 一个遗留现象（不影响结论）
 
@@ -1097,3 +1098,94 @@ write 0.014）→ 新 **0.341 ms/帧**，**19.9 倍**。而且连 render 本身�
 这是 bionic 在进程退出阶段对已销毁 mutex 的检查（`glFinish` 后 EGL 已开始
 teardown），发生在 `RESULT: AHB_OK` **之后**，不影响任何测量数据。
 真机（Adreno）上未验证是否同样出现。
+
+## 41. 跨探针数字不能横比 —— 我把 1.72 倍写成了 19.9 倍
+
+这是本仓库唯一一条**关于测量方法本身**的坑，比任何单个技术 bug 都值得记。
+
+### 事情经过
+
+`bench/ahb_test.c` 测出「1080p 渲染进 AHB = **0.341 ms/帧**」。
+`benchmark.md` 第六节记录的是「1080p render + glReadPixels + write = **6.777 ms/帧**」。
+
+我把这两个数一除，写成了 **19.9 倍**，还发布进了 README 级的对比表。
+
+**错在哪**：`0.341 ms` 只包含渲染，`6.777 ms` 包含渲染 + 回读 + 落盘。
+一个是 `glClear + glFinish`，另一个是完整帧泵。**分子分母口径不同。**
+
+### 正确的测法：同进程 A/B
+
+必须让两条路径在**同一个二进制、同一轮循环、同一个 EGL 上下文**里各跑一遍
+（`bench/ahb_topipe.c`）：
+
+```
+[A] AHB  render 1.144 + lock 3.954 + copy 1.213 = 6.344 ms/frame (157.6 fps)
+[B] RPIX render 1.111 + read 8.379 + copy 1.440 = 10.930 ms/frame (91.5 fps)
+>>> A/B ratio = 1.723x  (AHB FASTER)
+```
+
+真实收益：**1.72 倍**（720p 1.58×、360p 1.35×），不是 19.9 倍。
+来源集中在「GPU→CPU 取像素」：`AHB_lock` 3.954 vs `glReadPixels` 8.379（2.1 倍）。
+render 和 copy 两段基本没变，所以整体倍数被稀释。
+
+### 顺带纠正两个说法
+
+1. **`AHB_lock` 不是一次性的**。它每次取像素都要调，是每帧成本。之前写的
+   「4.5ms 是一次性开销，只在交给 SurfaceTexture 时发生」也是错的。
+2. **AHB 并不「免掉回读」**。GPU 渲染进 AHB 之后，CPU 要拿数据仍然必须
+   `AHB_lock`，而 lock 内部同样做 GPU→CPU 同步。AHB 的价值是**这条路更快**
+   （驱动侧对 dmabuf 的 cache 处理比 `glReadPixels` 那套逐行拷更高效），
+   不是「不需要回读」。
+   **真正不需要回读的只有一种情况**：AHB 直接交给 SurfaceFlinger / SurfaceTexture
+   由 GPU 侧消费 —— 但那需要 `AHardwareBuffer_createFromHandle`，本机不可用（见下）。
+
+### `AHardwareBuffer_createFromHandle` 在本机不可用
+
+想在另一个进程里重建 AHB，唯一官方途径是 `createFromHandle`。本机（模拟器
+dsh34 / Android 14 / x86_64）实测**一律返回 `-22(EINVAL)`**：
+
+```
+[selfcheck] real describe: 640x360 fmt=0x1 usage=0x30a stride=640
+[selfcheck] createFromHandle(real desc, CLONE) rc=-22 ahb=(nil)
+[selfcheck] createFromHandle(real desc, REFERENCE) rc=-22 ahb=(nil)
+[selfcheck] createFromHandle(zero desc, CLONE) rc=-22 ahb=(nil)
+[child] handle copy 104 bytes (version=12 numFds=2 numInts=21)
+[child] FAIL createFromHandle rc=-22
+```
+
+**已经排除的因素**（每一条都实测过）：
+
+| 怀疑点 | 排除方式 | 结果 |
+|---|---|---|
+| 参数个数错（是 4 参：desc/handle/method/out） | 逐个补齐 | 仍 -22 |
+| `desc` 用了申请时那份（stride=0） | 改用 `AHardwareBuffer_describe` 回读的真实 desc（stride=640） | 仍 -22 |
+| `desc` 应该全零让底层推断 | 试零 desc | 仍 -22 |
+| method 选错（CLONE vs REFERENCE） | 两个都试 | 两个都 -22 |
+| handle 复制长度错（`version`=12 只是头，不是全长） | 改成 `sizeof + (numFds+numInts)*4` = 104 字节 | 仍 -22 |
+| 跨进程 fd 继承 / SELinux | **同进程自测也失败** | 说明不是跨进程问题 |
+
+**真根因（环境级）**：
+
+```
+servicemanager: Could not find android.hardware.graphics.allocator.IAllocator/default
+                in the VINTF manifest.
+Gralloc4: mapper 4.x is not supported
+```
+
+模拟器的 gralloc 没有暴露 allocator HAL 的 VINTF 入口，`createFromHandle`
+需要走 mapper 去校验/重建，因此直接 EINVAL。**这是模拟器限制，真机（Adreno 840）
+很可能可用，但本轮真机离线（`192.168.101.21:9000` 连续 10+ 轮连不上）→ 未验证。**
+
+### 可行的退路
+
+`bench/ahb_topipe.c` 走「AHB 渲染 → lock → memcpy 到共享文件」，
+App 侧仍是原来的 mmap 路径、零改动。1080p 端到端 6.344 ms/帧（158 fps），
+比 glReadPixels 路径快 1.72 倍。**这是当前设备上能拿到的最好数字。**
+
+### 附带踩到的两个小坑
+
+1. **bionic 程序经 cleaner 在宿主侧执行时，路径按宿主根解析**。
+   探针里写 `open("/tmp/ahbf.bin")` 会失败（容器 `/tmp` ≠ 宿主 `/tmp`），
+   必须传宿主绝对路径。症状是 `FAIL open` 但容器里 `touch /zz` 明明成功。
+2. **`glReadPixels` 是 7 个参数**（x, y, w, h, format, type, pixels）。
+   少声明一个编译期就会报 `too many arguments`，这条倒是很好抓。

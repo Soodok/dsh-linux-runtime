@@ -816,9 +816,13 @@ for i, sid in enumerate(profile['samples']):
 **1.0 秒需要换掉加载模型（如 SEA / 单文件打包），不是调参数能到的。**
 这条结论写在这里，避免后续再在「调 flag / 裁插件」上反复尝试。
 
-## 14. AHB 零拷贝渲染：1080p 从 6.78 ms/帧 压到 0.34 ms/帧（19.9 倍）
+## 14. AHB 渲染路径：同进程 A/B 对照下 1080p 快 1.72 倍
 
-这是目前唯一一项**量化收益比以往所有优化加起来都大**的图形栈改进。
+> **⚠️ 本节发布时曾误写为「19.9 倍」，后被同进程 A/B 对照推翻并改正。**
+> 错误来源：拿「只渲染进 AHB 0.341 ms」去比「渲染 + glReadPixels 回读 6.777 ms」，
+> 而后者是上一轮**另一个探针、另一批次**的数字。两者测量口径不同，不可比。
+> 真实收益见下面的 A/B 表：**1080p 6.344 vs 10.930 ms/帧 = 1.72 倍**。
+> 这条教训已写进 pitfalls #41：**跨探针、跨批次的数字不能横比**。
 
 ### 为什么之前慢
 
@@ -863,18 +867,30 @@ AHardwareBuffer_allocate
 `center RGBA = 255,89,26,255`（精确对齐）。`FBO status = 0x8CD5`
 （`GL_FRAMEBUFFER_COMPLETE`）。
 
-### 对比表（1080p）
+### ★同进程 A/B 对照（`bench/ahb_topipe.c`）
 
-| 路径 | 每帧 | 折合 fps | 相对 |
+**这是唯一可信的对比方式**：同一个二进制、同一轮循环、同一个 EGL 上下文，
+A 路径走 AHB、B 路径走普通 FBO + glReadPixels，各跑 60 帧。
+
+| 分辨率 | A：AHB render+lock+copy | B：glReadPixels render+read+copy | 倍数 |
 |---|---|---|---|
-| 旧：render + glReadPixels + write | 6.777 ms | 147.6 | 1× |
-| **新：render into AHB** | **0.341 ms** | **2932** | **19.9×** |
+| 640×360 | **1.131 ms**（884 fps） | 1.523 ms（657 fps） | 1.35× |
+| 1280×720 | **3.162 ms**（316 fps） | 4.985 ms（201 fps） | 1.58× |
+| 1920×1080 | **6.344 ms**（158 fps） | 10.930 ms（91.5 fps） | **1.72×** |
 
-注意连 render 本身也快了（0.341 vs 1.125）—— 因为不再为「紧接着要回读」
-做额外同步。
+细分（1080p）：
 
-`AHB lock` 的 4.5 ms 是**一次性**的，只在 App 需要把 AHB 交给
-`SurfaceTexture` / `HardwareRenderer` 时发生，不是每帧成本。
+| 段 | AHB 路径 | glReadPixels 路径 |
+|---|---|---|
+| render + finish | 1.144 ms | 1.111 ms |
+| GPU→CPU 取像素 | **3.954 ms**（`AHB_lock`） | **8.379 ms**（`glReadPixels`） |
+| copy 到共享文件 | 1.213 ms | 1.440 ms |
+
+**结论**：`AHB_lock` 本身也包含 GPU→CPU 同步，所以它并不是「免费」的；
+但从 8.379 降到 3.954 —— **取像素那一段快了 2.1 倍**，这才是真实收益来源。
+整体 1.72 倍是因为 copy 和 render 两段没变，稀释了收益。
+
+`AHB_lock` 在单帧单次调用下是每帧成本（不是一次性），这点此前也写错过。
 
 ### 能力边界
 
@@ -884,7 +900,7 @@ AHardwareBuffer_allocate
 | AHB → EGLImage → GL texture → FBO | ✅ 实测（FBO COMPLETE） |
 | GPU 渲染进 AHB 后 CPU 读到正确像素 | ✅ 实测（255,89,26,255） |
 | 渲染吞吐 | ✅ 实测 1080p 0.341 ms/帧 |
-| **AHB 跨进程交给 App 的 SurfaceTexture** | ⬜ **未做** —— 需要在 Kotlin 侧建 `SurfaceTexture`/`HardwareRenderer`，并把 AHB 的 `native_handle` 或 fd 传过去。这是下一步 |
+| **AHB 跨进程交给 App** | ❌ **当前设备不可行** —— `AHardwareBuffer_createFromHandle` 在模拟器上一律返回 `-22(EINVAL)`。根因是 gralloc allocator 未进 VINTF：`servicemanager: Could not find android.hardware.graphics.allocator.IAllocator/default in the VINTF manifest.` + `Gralloc4: mapper 4.x is not supported`。同进程自测也失败、三种 desc × 两种 method 全 -22 → 环境级拒绝，非用法问题（详见 pitfalls #41）。真机未验 |
 | **真机 Adreno 验证** | ⬜ **未做** —— 全部数据来自 SwiftShader（CPU 渲染）。Adreno 上 render 会更快，但 `glEGLImageTargetTexture2DOES` 的路径需要重新确认 |
 | 硬件合成（不经过 App 贴图，直接进 SurfaceFlinger） | ❌ 仍需 app Binder，免 root 拿不到 |
 

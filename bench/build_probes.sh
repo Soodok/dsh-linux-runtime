@@ -20,7 +20,7 @@ for ARCH in $ARCHS; do
   [ -x "$CC" ] || { echo "缺少编译器 $CC" >&2; exit 1; }
   OUT="$HERE/out/$ARCH"
   mkdir -p "$OUT"
-  for src in gpu_probe frame_pump ipc_probe window_probe; do
+  for src in gpu_probe frame_pump ipc_probe window_probe framesrv; do
     # window_probe / ipc_probe 用裸 syscall 建 memfd，不需要额外库；
     # gpu_probe / frame_pump 走 dlopen，只链 libdl。
     "$CC" -O2 -o "$OUT/$src" "$HERE/$src.c" -ldl

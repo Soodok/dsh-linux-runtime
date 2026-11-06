@@ -23,7 +23,7 @@ D="/data/data/$PKG/files"
 
 [ -d "$SRC" ] || { echo "未找到 $SRC，先跑 ./build_probes.sh" >&2; exit 1; }
 
-for p in gpu_probe frame_pump ipc_probe window_probe; do
+for p in gpu_probe frame_pump ipc_probe window_probe framesrv; do
   "$ADB" -s "$DEV" push "$(cygpath -w "$SRC/$p" 2>/dev/null || echo "$SRC/$p")" "/data/local/tmp/$p" >/dev/null
   "$ADB" -s "$DEV" shell "cp /data/local/tmp/$p $R/distros/alpine/$p && chmod 755 $R/distros/alpine/$p"
 done

@@ -253,3 +253,47 @@ TLS/IE-TLSDESC 兼容、AHB gralloc backend、Wayland EGL 平台适配（含
 3. **输出文件路径必须显式传**。程序跑在 cleaner（bionic 环境）里，
    bionic 的 `/tmp` 与容器内的 `/tmp` 不是同一个东西且通常不可写，
    `fopen("/tmp/...")` 会静默失败（连文件都不出现）。
+
+### 6.7 跨进程帧共享：必须用普通文件，不能用 memfd（实测踩过）
+
+容器渲染出的帧要交给 App 贴图，中间那块内存怎么共享是关键。实测结论：
+
+| 方案 | 结果 |
+| --- | --- |
+| `memfd` + 宿主 `open("/proc/<pid>/fd/<n>")` | **不行**。只有 root 能 open，同 uid 的 `run-as` 进程被 SELinux 拦成 `Permission denied`（root 读 921600 B 正常，run-as 读报拒绝） |
+| `SCM_RIGHTS` 传 fd | 成本极低（0.011 ms），但需要宿主侧先建立 unix socket 连接，多一层生命周期管理 |
+| **普通文件 + 双方各自 mmap** | **可行**，零 root、零 Binder、零额外进程 |
+
+采用第三种：容器侧 `open(sharepath, O_RDWR|O_CREAT)` + `ftruncate` +
+`mmap(MAP_SHARED)`，`glReadPixels` 直接写进映射；宿主 `mmap` 同一文件即得
+RGBA 像素。共享文件必须放在 **App 可写目录**（`/data/data/<pkg>/files/`），
+不能放 rootfs 里 —— 那样宿主看不到。
+
+端到端实测（640×360 / SwiftShader / 16ms 间隔）：
+
+```
+DSH_FRAME pid=19271 w=640 h=360 fmt=rgba8888
+          path=/data/data/app.dsh.mobile/files/dshframe.bin
+          renderer=Android Emulator OpenGL ES Translator (Google SwiftShader)
+共享文件 921600 B = 640*360*4 ✓
+宿主读回中心像素 RGBA = 87,168,128,255（整帧渐变，视觉确认正确）
+稳定 32.8 fps（16ms 间隔的调度上限）
+```
+
+`framesrv.c` 就是这套方案的可运行实现，首行输出 `DSH_FRAME` 握手行供宿主
+解析尺寸与路径。
+
+### 6.8 至此「免 root 图形栈」的完整能力边界
+
+| 能力 | 状态 |
+| --- | --- |
+| 容器内 bionic 程序用宿主 GPU 渲染 | ✅ 实测 1080p 1.1~1.4 ms/帧 |
+| 像素回读 | ✅ 5.3~6.0 ms/帧（1080p） |
+| 跨进程交给宿主 | ✅ 普通文件 + mmap，零拷贝 |
+| 全链路帧率上限 | ✅ 1080p 137~156 fps / 720p 300+ fps |
+| 直接建系统窗口（SurfaceFlinger layer） | ❌ 需 app Binder，免 root 拿不到 |
+| 硬件合成（AHB/gralloc 零回读） | ❌ 需 libhybris，未实现 |
+
+结论：**「容器里跑图形程序并把画面显示在 App 里」这条路已经通**，缺的只是
+App 侧的 SurfaceView 贴图代码；而「容器程序像原生 App 一样拥有自己的系统
+窗口、硬件合成」仍然需要 compositor + libhybris，那是另一条路线。

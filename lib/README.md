@@ -28,10 +28,33 @@ if (dsh_frame_open(&f, 1280, 720, "/data/data/<pkg>/files/dshframe.bin") != 0) {
 while (running) {
     /* 你的 GL 代码，画在默认 framebuffer 上 */
     glClearColor(...); glClear(...); glDrawArrays(...);
-    dsh_frame_present(&f);      /* glFinish + glReadPixels + 推进 seq */
+    dsh_frame_present(&f);      /* glFinish + 取像素 + 推进 seq */
 }
 dsh_frame_close(&f);
 ```
+
+### 想更快：`dsh_frame_open_ex()`
+
+```c
+/* DSH_PIX_RPIX  glReadPixels，最稳，所有设备都能用
+ * DSH_PIX_AHB   渲染进 AHardwareBuffer 再 lock，1280x720 快 1.56 倍
+ * DSH_PIX_AUTO  有 AHB 就用，没有自动退回 rpix —— 产线用这个 */
+if (dsh_frame_open_ex(&f, 1280, 720, path, DSH_PIX_AUTO) != 0) { ... }
+printf("实际用的取像素方式: %s\n", dsh_frame_pixmode_name(&f));  /* "ahb" 或 "rpix" */
+```
+
+**AHB 不可用时仍返回 0（成功）**，只是安静退回 `rpix` —— 调用方不需要
+自己探测 gralloc 支持度，真机与模拟器行为不同，让库兜这件事。
+
+实测（容器内，模拟器 x86_64 / SwiftShader，各 60 帧）：
+
+| 分辨率 | rpix | ahb | 倍数 |
+|---|---|---|---|
+| 640×360 | 761.4 fps | 1027.2 fps | 1.35× |
+| 1280×720 | 207.9 fps | 324.0 fps | 1.56× |
+| 1920×1080 | 101.1 fps | 149.8 fps | 1.48× |
+
+像素逐字节一致（`cmp` 两条路径的共享文件 → `IDENTICAL`）。
 
 ## 编译
 

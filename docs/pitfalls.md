@@ -1189,3 +1189,69 @@ App 侧仍是原来的 mmap 路径、零改动。1080p 端到端 6.344 ms/帧（
    必须传宿主绝对路径。症状是 `FAIL open` 但容器里 `touch /zz` 明明成功。
 2. **`glReadPixels` 是 7 个参数**（x, y, w, h, format, type, pixels）。
    少声明一个编译期就会报 `too many arguments`，这条倒是很好抓。
+
+---
+
+## #42 `dsh_gl` 库的 AHB 路径：把「一个程序能用」变成「所有程序能用」
+
+### 症状
+
+`bench/framesrv.c` 的 AHB 路径已经验证通过（1080p 1.50 倍），但把同样
+逻辑写进 `lib/dsh_gl.c` 后，容器内其他 GL 程序仍然只有 `glReadPixels` 一条路。
+
+这不是 bug，是**层次问题**：`framesrv.c` 是产线**一个程序**的实现，
+`lib/dsh_gl` 是给容器内**任意** GL 程序用的库。只有库这一层支持 AHB，
+「容器图形栈」才算真的补齐——否则每个程序都要各自复制一遍四步链路。
+
+### 修法（库 API 设计）
+
+`dsh_frame_open()` 保持原签名不变（零破坏），新增：
+
+```c
+int dsh_frame_open_ex(dsh_frame *f, int w, int h, const char *sharepath, int pixmode);
+const char *dsh_frame_pixmode_name(const dsh_frame *f);
+
+#define DSH_PIX_RPIX 0   /* glReadPixels，最稳 */
+#define DSH_PIX_AHB  1   /* AHardwareBuffer，快但依赖 gralloc */
+#define DSH_PIX_AUTO 2   /* 有 AHB 就用，没有自动退回 rpix */
+```
+
+三条设计约束：
+
+1. **`DSH_PIX_AHB` 探测失败也必须返回 0**（成功），不是报错。
+   调用方不需要自己判断 gralloc 支持度 —— 真机与模拟器行为不同
+   （模拟器 `createFromHandle` 恒 `-22`，见 #41），让库兜这件事。
+   实际用了哪条路由 `dsh_frame_pixmode_name()` 报出。
+
+2. **`present` 时 AHB lock 失败要退回一次 `glReadPixels`**，不能整帧丢掉。
+   帧服务的语义是「尽量出帧」，不是「出错就停」。
+
+3. **`stride` 可能 > `w*4`**（对齐），必须按行拷。实测 640 宽时
+   `stride=640`（无对齐余量），但 1080p 在真机上常见 1088/1152。
+
+### 实测（模拟器 dsh34 / x86_64 / SwiftShader，各 60 帧，三轮取中位）
+
+| 分辨率 | rpix | ahb | 倍数 |
+|---|---|---|---|
+| 640×360 | 761.4 fps | **1027.2 fps** | 1.35× |
+| 1280×720 | 207.9 fps（181.0/207.9/239.7） | **324.0 fps**（310.7/354.5/324.0） | **1.56×** |
+| 1920×1080 | 101.1 fps | **149.8 fps** | **1.48×** |
+
+**像素逐字节一致**：`cmp gl_rpix.bin gl_ahb.bin` → `IDENTICAL`。
+这很关键——「快」不能是拿画面对不上换来的。
+
+### 一个容易忽略的执行前提
+
+`dsh_gl_pixmode` 是 bionic 程序（经 cleaner 代跑），**它看到的路径按宿主根解析**
+（见 #41）。所以共享文件路径要传宿主路径：
+
+```sh
+# 对：宿主绝对路径
+/bin/sh -c '/dsh_gl_pixmode /data/local/tmp/g.bin ahb 640 360 60'
+
+# 错：容器路径，cleaner 按宿主根解析 → open ENOENT
+/bin/sh -c '/dsh_gl_pixmode /tmp/g.bin ahb 640 360 60'
+```
+
+App 侧不受影响（`LinuxFrameSurface` 传的本来就是
+`/data/data/<pkg>/files/dshframe.bin`，本身就是宿主路径）。

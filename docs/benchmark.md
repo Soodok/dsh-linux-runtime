@@ -518,6 +518,45 @@ weston-debug scene-graph
 **这是「容器内能开 GUI 窗口」的直接证据**：`xdg_toplevel` 角色的顶层窗口、
 250×250 居中、带 panel 与 background，全部由容器内的 weston 合成。
 
+### 6.9 `lib/dsh_gl` 库层三路径（rpix / ahb / auto）
+
+产线 `framesrv.c` 好，不等于**库**好。`lib/dsh_gl` 是给容器内任意 GL 程序用的，
+它支持 AHB 才算「容器图形栈补齐」——否则每个程序都要各自复制四步链路。
+
+探针：`lib/pixmode_probe.c`，输出 `RESULT: DSH_GL_PIXMODE_OK`。
+
+```sh
+R=/data/data/app.dsh.mobile/files/linux/distros/alpine
+RUN=/data/data/app.dsh.mobile/files/linux/runner/dsh_alpine
+# ★共享文件必须传宿主路径：bionic 经 cleaner 执行时按宿主根解析（pitfalls #41）
+for m in rpix ahb auto; do
+  $RUN $R /lib/ld-musl-x86_64.so.1 /bin/sh -c     "/dsh_gl_pixmode /data/local/tmp/g_$m.bin $m 1280 720 60"
+done
+cmp /data/local/tmp/g_rpix.bin /data/local/tmp/g_ahb.bin   # 必须 IDENTICAL
+```
+
+实测（模拟器 dsh34 / x86_64 / SwiftShader，各 60 帧）：
+
+| 分辨率 | rpix | ahb | 倍数 |
+|---|---|---|---|
+| 640×360 | 761.4 fps | **1027.2 fps** | 1.35× |
+| 1280×720 | 207.9 fps（三轮 181.0 / 207.9 / 239.7） | **324.0 fps**（310.7 / 354.5 / 324.0） | **1.56×** |
+| 1920×1080 | 101.1 fps | **149.8 fps** | **1.48×** |
+
+`req` 与 `actual` 的对应关系（这是设计的核心）：
+
+| 传入 | 实际 | 说明 |
+|---|---|---|
+| `rpix` | 必为 `rpix` | 绝不会偷偷升到 ahb |
+| `ahb` | `ahb` 或 `rpix` | gralloc 不支持时**安静退回**，返回值仍是 0 |
+| `auto` | 同 `ahb` | 产线用这个 |
+
+**像素逐字节一致**（`cmp` → `IDENTICAL`）：三条路径写出的共享文件完全相同，
+「快」不是拿画面对不上换来的。
+
+`stride` 实测 640 宽时为 640（无对齐余量），1024 宽时为 1024。真机上
+1080p 常见 1088/1152，所以库必须按行拷，不能整块 `memcpy`。
+
 ### 能力边界
 
 | 项 | 状态 |

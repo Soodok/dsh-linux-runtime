@@ -55,16 +55,21 @@ typedef struct dsh_frame {
     size_t   bytes;                 /* 像素字节数 = w*h*4 */
     unsigned seq;                   /* 已 present 的帧数 */
 
+    /* 取像素方式 */
+    int      pixmode;               /* 0 = glReadPixels，1 = AHardwareBuffer */
+    unsigned ahb_stride;            /* AHB 的实际行跨度（可能 > w*4，需按行拷） */
+
     /* 不透明：EGL/GL 句柄与函数指针。用户不要碰。 */
     void    *egl_display;
     void    *egl_surface;
     void    *egl_context;
     void    *gl_lib;
+    void    *ahb;                   /* AHardwareBuffer*（pixmode=1 时有效） */
     void    *(*sym)(void *lib, const char *name);
 } dsh_frame;
 
 /*
- * 打开帧通道并初始化 GL。
+ * 打开帧通道并初始化 GL（等价于 dsh_frame_open_ex(..., DSH_PIX_DEFAULT)）。
  *
  * @param w,h      画面尺寸（像素）。小于 16 会被夹到 16。
  * @param sharepath 共享文件路径；NULL 用默认
@@ -74,8 +79,34 @@ typedef struct dsh_frame {
  */
 int dsh_frame_open(dsh_frame *f, int w, int h, const char *sharepath);
 
+/* 取像素方式 */
+#define DSH_PIX_DEFAULT  0   /* 同 DSH_PIX_RPIX */
+#define DSH_PIX_RPIX     0   /* glReadPixels 逐行回读（最稳，所有设备都能用） */
+#define DSH_PIX_AHB      1   /* 渲染进 AHardwareBuffer 再 lock（快，但依赖 gralloc） */
+#define DSH_PIX_AUTO     2   /* 有 AHB 就用，没有自动退回 rpix */
+
 /*
- * 提交一帧：glFinish → glReadPixels 写进共享文件 → 推进 seq。
+ * 带取像素方式的重载。
+ *
+ * 为什么要这个：产线实测（模拟器 x86_64 / SwiftShader，各 60 帧）
+ *   1280x720   rpix 210.4 fps -> ahb 286.0 fps   (1.36x)
+ *   1920x1080  rpix  80.8 fps -> ahb 121.4 fps   (1.50x)
+ * 像素逐字节一致。收益集中在「GPU→CPU 取像素」那一段。
+ *
+ * ★不管传什么 mode，**AHB 不可用时都会安静退回 rpix**，并用
+ *   dsh_frame_pixmode_name() 报出实际用的方式。调用方不需要自己探测
+ *   gralloc 支持度 —— 真机与模拟器行为不同（模拟器 createFromHandle 恒
+ *   -22，见 pitfalls #41），让库来兜这件事。
+ *
+ * @return 0 成功（**含 AHB 探测失败后退回 rpix 的情况**）
+ */
+int dsh_frame_open_ex(dsh_frame *f, int w, int h, const char *sharepath, int pixmode);
+
+/* 实际生效的取像素方式：返回 "ahb" 或 "rpix"（静态串） */
+const char *dsh_frame_pixmode_name(const dsh_frame *f);
+
+/*
+ * 提交一帧：glFinish → 取像素（rpix 或 AHB lock）→ 写进共享文件 → 推进 seq。
  * 调用前请把要显示的图画在默认 framebuffer 上。
  * @return 0 成功
  */

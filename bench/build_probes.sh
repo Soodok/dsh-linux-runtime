@@ -26,4 +26,8 @@ for ARCH in $ARCHS; do
     "$CC" -O2 -o "$OUT/$src" "$HERE/$src.c" -ldl
     echo "  $ARCH/$src  $(stat -c%s "$OUT/$src") B"
   done
+  # dsh_gl 库探针：验证容器内**任意** GL 程序都能吃到 AHB 收益
+  # （framesrv 好不等于库好，这块是给第三方程序用的）
+  "$CC" -O2 -fPIC -o "$OUT/dsh_gl_pixmode"     "$HERE/../lib/pixmode_probe.c" "$HERE/../lib/dsh_gl.c" -ldl
+  echo "  $ARCH/dsh_gl_pixmode  $(stat -c%s "$OUT/dsh_gl_pixmode") B"
 done

@@ -620,6 +620,44 @@ failed to initialize allocator
 
 **不要把「窗口能开」说成「硬件加速窗口能开」** —— 这两件事差着一整条 libhybris。
 
+### 6.12 容器合成画面 → App 共享文件（wlr-screencopy）
+
+`weston_capture_v1` 有授权模型（只授予 screen-share 拉起的 RDP 客户端），
+`grim` 在 weston 下报 unauthorized（#36）。改用 wlroots 系（sway）的
+`wlr-screencopy`，无授权限制。
+
+`bench/wlshot.c` 抓一帧后**直接写成 dsh_gl 共享文件格式**，App 侧
+`LinuxFrameSurface` 零改动即可显示：
+
+```sh
+apk add --no-interactive wlr-protocols wayland-dev gcc musl-dev sway grim
+sh /build_wlshot.sh /wlsrc
+
+WLR_BACKENDS=headless WLR_RENDERER=pixman WAYLAND_DISPLAY=wayland-1   /wlsrc/wlshot /data/data/<pkg>/files/dshframe.bin 5000
+```
+
+实测（模拟器 dsh34 / x86_64）：
+
+```
+WLSHOT_KV output=1280x720
+WLSHOT_KV format=0x1            ← WL_SHM_FORMAT_XRGB8888
+WLSHOT_KV copied=1
+WLSHOT_KV bytes=3686400
+RESULT: WLSHOT_OK
+```
+
+共享文件 3686416 B = 16 头 + 1280×720×4；magic `0x4D415246`、seq=1。
+
+**★XRGB8888 的第 4 字节是 X（未定义），不是 alpha。** 实测同一窗口内
+alpha 全 0、窗口外全 255 —— 纯垃圾。App 侧 `ARGB_8888` +
+`copyPixelsFromBuffer` 会当真读，alpha=0 的区域被当全透明 →
+**用户看到一片空白且不报错**。转换时必须 `pix[i+3] = 255`，
+不能抄源字节。修复前后同一帧渲染成 PNG：修复前窗口区是**纯白一块**，
+修复后蓝→橙渐变完整可见。
+
+这个坑查不出来是因为**所有结构性检查都通过**：字节数 ✓ magic ✓
+seq ✓ 尺寸 ✓。必须逐像素采样 + 看图（#45）。
+
 ### 能力边界
 
 | 项 | 状态 |

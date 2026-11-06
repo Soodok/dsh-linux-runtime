@@ -1452,3 +1452,94 @@ adb shell "rm -f /dev/shm/*; rmdir /dev/shm"
    Linux 桌面标配，Android 没有。
 3. **同一个路径要改两处**（C 侧翻译 + Kotlin 侧建目录），只改一处症状不变，
    所以必须两边都有探针守着（`scripts/probes/_test_linux_shm.py`，A/B 两段）。
+
+---
+
+## #45 容器 GUI 画面进 App：wlr-screencopy + XRGB8888 的 alpha 陷阱
+
+### 为什么不是 weston
+
+`weston_capture_v1` 有授权模型：只授予 screen-share 拉起的 RDP 客户端，
+`grim` / `weston-screenshooter` 一律 `Output capture error: unauthorized`
+（pitfalls #36）。这条路走不通。
+
+`wlr-screencopy` 是 wlroots 系（sway）的标准抓取协议，**无授权限制**，
+`grim` 直接可用。所以容器里的「开窗口」用 weston 验证（#43），
+「抓画面」用 sway + wlr-screencopy。
+
+### 探针 `bench/wlshot.c`
+
+抓一帧 → 转成 dsh_gl 共享文件格式 → App 侧 `LinuxFrameSurface` 零改动就能显示。
+
+```sh
+apk add --no-interactive wlr-protocols wayland-dev gcc musl-dev sway grim
+sh /build_wlshot.sh /wlsrc
+
+# 起 compositor 与一个窗口，然后抓帧
+WLR_BACKENDS=headless WLR_RENDERER=pixman WAYLAND_DISPLAY=wayland-1 \
+  /wlsrc/wlshot /data/data/<pkg>/files/dshframe.bin 5000
+```
+
+实测（模拟器 dsh34 / x86_64）：
+
+```
+WLSHOT_KV output=1280x720
+WLSHOT_KV format=0x1            ← WL_SHM_FORMAT_XRGB8888
+WLSHOT_KV copied=1
+WLSHOT_KV bytes=3686400
+RESULT: WLSHOT_OK
+```
+
+共享文件 3686416 B = 16 头 + 1280×720×4，magic `0x4D415246`、seq=1。
+
+### ★XRGB8888 的第 4 字节是 X，不是 alpha
+
+这是**最隐蔽的一个坑**，因为所有结构性检查都通过：
+
+```
+字节数正确 ✓   magic 正确 ✓   seq 正确 ✓   尺寸正确 ✓
+```
+
+但逐像素采样会看到：
+
+```
+窗口内 y=150：
+  x=  50  RGBA=( 30, 89,225,  0)     ← alpha=0！
+  x= 200  RGBA=(126, 89,129,  0)     ← alpha=0！
+窗口外：
+  x= 500  RGBA=(  0,  0,  0,255)     ← 反了，这里 alpha=255
+```
+
+alpha 值完全是**垃圾**（同一个窗口内全 0、窗口外全 255）。
+
+App 侧 `LinuxFrameSurface` 用 `Bitmap.Config.ARGB_8888` +
+`copyPixelsFromBuffer`，会**当真读 alpha**。抄过去 alpha=0 的区域被当成
+全透明 → **用户在 App 里看到一片空白，且不报任何错**。
+
+修法就一行：转换时 `pix[i+3] = 255;`，不抄源的第 4 字节。
+
+```c
+for (i = 0; i + 3 < pixbytes; i += 4) {
+    pix[i + 0] = s[i + 2];  /* R */
+    pix[i + 1] = s[i + 1];  /* G */
+    pix[i + 2] = s[i + 0];  /* B */
+    pix[i + 3] = 255;       /* A —— 绝不抄 s[i+3] */
+}
+```
+
+修复前后对比（同一份帧数据渲染成 PNG）：
+
+| | 窗口区域 |
+|---|---|
+| 修复前 | **纯白一块**（alpha=0，颜色信息视觉上丢失） |
+| 修复后 | 蓝→橙渐变完整可见 |
+
+### 教训
+
+1. **「结构正确」不等于「内容正确」**。字节数/magic/尺寸全对，像素却是错的。
+   凡是有颜色通道的产物，必须**逐像素采样 + 看图**，不能只验长度。
+2. **共享内存格式的 alpha 约定必须两边都明确**。`XRGB8888` 的 X 是
+   「不要用」，`ARGB_8888` 的 A 是「必须用」—— 两个名字只差一个字母，
+   语义差一个通道。
+3. **优先选无授权门槛的协议**。同样的「抓合成画面」，weston 要授权、
+   wlroots 不要，选错要多花一整轮。

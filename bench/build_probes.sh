@@ -34,5 +34,7 @@ done
 # wlwin（Wayland 窗口客户端）是 **musl** 程序，必须在容器内用 gcc 编译，
 # 不能用 NDK 交叉编译（NDK 只有 bionic）。编译脚本见 scripts/build_wlwin.sh。
 echo ""
-echo "注意：bench/wlwin.c 需在容器内编译（musl + wayland-client），"
-echo "      见 scripts/build_wlwin.sh；它不在本脚本的 NDK 产物里。"
+echo "注意：以下三个需在容器内编译（musl），不在本脚本的 NDK 产物里："
+echo "  bench/wlwin.c  → scripts/build_wlwin.sh   （开窗口，xdg-shell）"
+echo "  bench/wlshot.c → scripts/build_wlshot.sh  （抓帧，wlr-screencopy）"
+echo "  bench/unixsock_guest.c → 容器内 gcc -O2 -o unixsock_guest unixsock_guest.c"

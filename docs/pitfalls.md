@@ -518,3 +518,33 @@ EGL (pbuffer / surfaceless) → GLES 渲染 → glReadPixels → 共享文件 �
 2. 让 App 侧自己实现一个 X server（工程量巨大）；
 3. 走 Xvfb 但把锁文件目录换到 SELinux 允许 link 的上下文（需要设备策略配合，
    通用性差）。
+
+## 33. phantom process killer 的判定口径 —— 用 run-as 测不出来
+
+Android 12+ 有 phantom process killer：App 派生出的**幽灵进程**总数超过
+`max_phantom_processes`（模拟器实测 32）就会被系统整批杀掉。TAWC 的 README
+把这条列为限制，要求用户去开发者选项关掉「禁止子进程限制」。
+
+但**用 `run-as` 起容器无法验证这条限制**，因为两者的进程归属不同：
+
+```
+run-as 起的容器：  cat /proc/self/cgroup  →  memory:/  cpuset:/  cpu:/
+App 自己起的容器：  cat /proc/<apppid>/cgroup → memory:/ cpuset:/top-app cpu:/top-app
+```
+
+`run-as` 的父进程是 adbd，不在 App 的进程树里，因此 phantom killer 的计数
+根本不会把它算进去。实测 `run-as` 下起 120 个 `sleep` 全部存活（124 个进程），
+**这个数字对「App 内能跑多少进程」毫无参考价值**。
+
+要真测这条限制，必须在 App 进程内启动容器（即真机装上 App 走 UI），
+再看 logcat 的 `Excessive phantom processes` 与进程存活情况。这轮手机离线，
+所以此项**未实测**。
+
+### 对我们可能的结构性优势（待真机验证）
+
+我们的容器进程是 App 自己的子进程（`ps -A -o PID,PPID` 里 PPID = App pid，
+走 binder 关联），理论上比 TAWC 那种「独立启动、靠 shell 挂载」的形态更容易
+被系统认作 App 的一部分。若真机上确认不触发 phantom killer，那意味着
+**用户不用去开发者选项关任何东西**，这是能写进对比表的实打实差异。
+
+**但这只是推测，必须真机验证后才能当结论用。**

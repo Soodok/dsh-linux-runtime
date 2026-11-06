@@ -432,3 +432,41 @@ RESULT: PATH_PROBE_OK (fails=0)
 | 引擎启动 | `startup failed: 2 required plugins did not activate` | 只有一行 `dsh web:` |
 | profile 健康 | 7 个服务 missing | 全绿 |
 | 首页 | 无 | HTTP 200 / 46437 B / 70 个客户端插件 |
+
+## 8. AF_UNIX socket（compositor / X11 / dbus 的前置条件）
+
+`bind` 与 `connect` 的 `sockaddr_un.sun_path` 都要翻译，缺一层就会出现
+「服务端能起、客户端连不上」。探针在同一进程内自 bind 自 connect 并传一个
+字节，一次覆盖两层。
+
+```sh
+x86_64-linux-android28-clang -O2 -static -o unix_socket_probe bench/unix_socket_probe.c
+dsh_alpine -m /dsh:<home> <rootfs> /lib/ld-musl-x86_64.so.1 /bin/sh -c '/unix_socket_probe /tmp /dsh /var/tmp'
+```
+
+实测（模拟器 dsh34 / Android 14 / x86_64）：
+
+```
+/tmp                     bind+connect+rw OK
+/dsh                     bind+connect+rw OK
+/var/tmp                 bind+connect+rw OK
+
+RESULT: UNIX_SOCKET_OK (fails=0)
+```
+
+### 端到端：weston 14.0.2 headless compositor
+
+| 阶段 | 修复前 | 修复后 |
+|---|---|---|
+| `bind` socket | `fatal: failed to add socket: No such file or directory` | `/tmp/wl/test` 建出 `srwxrwxrwx` |
+| weston 启动 | 立刻退出 | 4 个进程驻留（weston + keyboard + desktop-shell） |
+| `weston-simple-shm` | — | 存活（持续重绘），**不再 failed to create display** |
+| `grim` 截图 | `failed to create display` | `compositor doesn't support wlr-screencopy-unstable-v1`（协议不支持，但**已连上**） |
+
+> grim 那条错误是「连上了但 compositor 没实现该协议」，与「连不上」是两回事。
+> weston 的 headless 后端不提供 `wlr-screencopy`，需要换成 weston 自己的
+> `weston-screenshooter`（它走 `weston_capture_v1`）；实测该工具在无窗口内容
+> 时报 `Assertion failed: width > 0`，需先有客户端 surface 输出。
+
+weston 相关 Alpine 包（已实测可装）：`weston`、`weston-backend-headless`、
+`weston-clients`、`weston-shell-desktop`、`grim`。

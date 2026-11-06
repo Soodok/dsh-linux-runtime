@@ -675,3 +675,94 @@ for (const p of ["/dsh/profiles/web","/eng","/tmp"]) {
 **修复前后对比**：修复前 `dsh: startup failed: 2 required plugins did not activate`
 + 7 个服务 missing；修复后日志**只有一行** `dsh web:`，首页 46437 字节、
 70 个客户端插件全部入 boot manifest。
+
+## 35. AF_UNIX socket 路径不翻译 —— 所有 compositor / X11 / dbus 都起不来
+
+**症状**（三种表现，同一条根因，极易误判成三个不同问题）：
+
+```
+# 服务端（weston / Xvfb / 任何监听 AF_UNIX 的程序）
+libwayland: bind() failed with error: No such file or directory
+fatal: failed to add socket: No such file or directory
+
+# 客户端（修好 bind 之后才会看到这一层）
+failed to create display                    # grim / wayland 客户端
+libwayland: failed to connect to socket
+
+# X11
+Fatal server error:
+Linking lock file (/tmp/.X99-lock) in place failed: Permission denied
+```
+
+**原因**：`sockaddr_un.sun_path` 也是 guest 路径，但 `bind` / `connect` 这两个
+syscall **原本都不在 BPF 树里**，于是被透明转发，内核拿 guest 路径去宿主根下
+解析 —— 那个目录在宿主不存在，返回 ENOENT（X11 那条是 `link()` 另有限制，
+见下）。
+
+这是**两层独立的缺失**，必须都修，否则症状会从「服务端起不来」变成
+「服务端起来了但客户端连不上」：
+
+| 层 | syscall | 缺了会怎样 |
+|---|---|---|
+| 1 | `bind` | socket 文件建不出来 → compositor 直接 fatal 退出 |
+| 2 | `connect` | socket 建出来了，但客户端连不上 → `failed to create display` |
+
+**修法**（`dsh-linux-runtime/src/dsh_alpine.c`）：
+
+1. `tools/gen_bpf_tree.py` 的 `NEEDED` 加 `"bind"`（`connect` 本来就在，
+   但它只处理 AF_INET 的 DNS 端口改写，要另开 AF_UNIX 分支）。
+2. 两个 handler 里对 `fam == 1`（AF_UNIX）且 `sun_path[0] == '/'` 的地址做
+   路径翻译：先 `bind_map()`（命中 bind 挂载点），再 `make_host()`
+   （拼 rootfs 前缀）。
+3. **必须重新拼一个完整的 `sockaddr_un`**，不能只把路径字符串换掉再传原
+   `a1` 指针 —— 长度语义要求 `addrlen = 2 + strlen(path) + 1`，且
+   `sun_path` 紧跟 `sun_family`。实测只改 addrlen 而内容仍指 guest 缓冲区时
+   内核看到「新长度 + 旧内容」，直接 `EINVAL`（三个路径全部 Invalid argument）。
+
+```c
+struct sockaddr_un_s { unsigned short sun_family; char sun_path[108]; } sa2;
+char hb[PATH_MAX];
+const char *use;
+if (bind_map(pb, hb)) use = hb;
+else { make_host(hb, pb); use = hb; }
+int plen = ldr_strlen(use);          // freestanding：没有 strlen，用 ldr_strlen
+if (plen > 107) plen = 107;
+sa2.sun_family = 1;                   // AF_UNIX
+for (int i = 0; i < plen; i++) sa2.sun_path[i] = use[i];
+sa2.sun_path[plen] = 0;
+r[0] = raw6(SYS_bind, a0, (long)&sa2, (long)(2 + plen + 1), 0, 0, 0);
+```
+
+抽象命名空间（`sun_path[0] == 0`）与相对路径**不翻译**，原样透传。
+
+**验证**（模拟器 dsh34 / Android 14 / x86_64）：
+
+```
+# 1. 裸 syscall 层
+bind(/tmp/wl/t1) = 0 OK    listen = 0 OK
+bind(/tmp/t3)     = 0 OK    listen = 0 OK
+bind(/dsh/t2)     = 0 OK    listen = 0 OK
+
+# 2. 真实 compositor（weston 14.0.2 headless 后端）
+[log] Loading module '/usr/lib/libweston-14/headless-backend.so'
+[log] Output 'headless' enabled with head(s) headless
+[log] Loading module '/usr/lib/weston/desktop-shell.so'
+[log] launching '/usr/libexec/weston-desktop-shell'
+[fs]  /tmp/wl/test        (srwxrwxrwx)   ← socket 建出来了
+[fs]  /tmp/wl/test.lock
+
+# 3. 真实 Wayland 客户端
+weston-simple-shm  → 存活（持续重绘），不再 failed to create display
+grim /tmp/shot.png → 报 "compositor doesn't support wlr-screencopy-unstable-v1"
+                     ↑ 这是协议不支持，说明**已经连上 compositor 了**
+                     （修 connect 之前报的是 "failed to create display"）
+```
+
+**顺带澄清一条旧结论**：`docs/pitfalls.md` #32 曾把 X11/Xvfb 起不来归因成
+「SELinux 禁止 `link()`」。那个限制**确实存在**（avc 实测：
+`avc: denied { link } for comm="ln" scontext=u:r:runas_app:s0
+tcontext=u:object_r:app_data_file:s0 tclass=file permissive=0`，
+而无 root 时 `Xvfb -nolock` 也报 "can only be used by root"），但它只是
+**X11 专属的第二道限制**；任何 AF_UNIX 服务的**第一道**限制都是本文这条路径
+翻译缺失。wayland 路线不需要 `link()`，所以走 wayland compositor 可以绕开
+X11 那道。

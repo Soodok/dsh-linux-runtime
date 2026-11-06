@@ -5,7 +5,8 @@ NR = {
  "renameat":38,"statfs":43,"fstatfs":44,"faccessat":48,"chdir":49,"fchmodat":53,
  "fchownat":54,"openat":56,"readlinkat":78,"newfstatat":79,"utimensat":88,
  "rt_sigaction":134,"rt_sigprocmask":135,"clone":220,"execve":221,"renameat2":276,
- "execveat":281,"statx":291,"sendto":206,"sendmsg":211,"recvfrom":207,"recvmsg":212,"openat2":437,"faccessat2":439,
+ "execveat":281,"statx":291,"sendto":206,"sendmsg":211,"recvfrom":207,"recvmsg":212,
+ "connect":203,"openat2":437,"faccessat2":439,
 }
 DIRFD = {"openat","newfstatat","faccessat","readlinkat","statx","unlinkat","mkdirat",
          "fchmodat","fchownat","utimensat","mknodat","openat2","faccessat2"}

@@ -20,7 +20,7 @@ import re
 import sys
 
 NR = {
- "connect":203,
+ "connect":203, "sendto":206, "recvfrom":207, "sendmsg":211, "recvmsg":212,
     "getcwd": 17, "mknodat": 33, "mkdirat": 34, "unlinkat": 35, "symlinkat": 36,
     "linkat": 37, "renameat": 38, "statfs": 43, "fstatfs": 44, "faccessat": 48,
     "chdir": 49, "fchmodat": 53, "fchownat": 54, "openat": 56, "readlinkat": 78,

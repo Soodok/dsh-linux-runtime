@@ -231,3 +231,62 @@ syscall 直接按默认动作杀进程。
 **修法**：新增 `path_looks_like_android()`，按前缀识别
 `/system/bin`、`/apex/`、`/odm/bin`、`/vendor/bin`、`/data/adb/` 等
 （这些绝不会出现在 Linux 发行版里），两处 PATH 分支都加判断。
+
+## 27. 移植到新架构后 `Bad system call`（RC=159），且 `strace` 只报 SIGSEGV
+
+**症状**（在 x86_64 上移植本方案时实测，Android 14 模拟器）：
+
+- 程序 rc=159 `Bad system call`，strace 里却是
+  `--- SIGSEGV {si_signo=SIGSEGV, si_code=SI_KERNEL, si_addr=NULL} ---`
+  —— 看起来像「handler 返回时跳到 NULL」。
+- 极简 demo 只装 `SECCOMP_RET_TRAP` + handler 也复现；
+  更怪的是**连 handler 之前的第一条 `write` 都没输出**（strace 只有
+  `execve(...) = 0` 和一行 SIGSEGV），极易误判成 `_start` / restorer /
+  `sigaltstack` 布局有问题。
+- 而不装 filter 时，`rt_sigaction` / `raw6` / `_start` 全部正常。
+
+**原因**：`install_filter()` 的 cBPF 里那条 **IP 高 32 位白名单**被漏掉了。
+原实现是：
+
+```c
+#define LOADER_BASE_HI 0x20u
+BPF_STMT(BPF_LD|BPF_W|BPF_ABS, offsetof(struct seccomp_data, instruction_pointer) + 4),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, LOADER_BASE_HI, <->ALLOW>, 0),
+```
+
+它的作用是：**凡是从 loader 自己代码里发出的 syscall，一律 ALLOW，先进 BPF 树**。
+handler 内部的「自愈」调用（`sigsys()` 里的
+`raw6(SYS_rt_sigprocmask, SIG_UNBLOCK, &set, ...)`、`child_run_raw()` 跳转前的
+解除阻塞、fork 子进程里的解除阻塞，共三处）正是靠这条放行的。
+
+漏掉它 → handler 里那条 `rt_sigprocmask` 被自己的 filter 再 TRAP 一次 →
+**嵌套 SIGSYS**。SIGSYS 在 handler 执行期间默认被内核阻塞，没有 handler 可投递，
+内核就按致命错误处理，aarch64 报 `Bad system call`、x86_64 报
+`SIGSEGV(SI_KERNEL)`。这就是「看起来在 handler 之前就死了」的来源——
+其实早已进了 handler，死在 handler 内部那行。
+
+**修法**：移植到任何新架构，cBPF 头部这 4 条**一条都不能少**：
+
+```c
+0  BPF_LD   seccomp_data.arch
+1  BPF_JEQ  AUDIT_ARCH_<target>  -> 2 : -> KILL_PROCESS
+2  BPF_LD   seccomp_data.instruction_pointer + 4    // 高 32 位（小端低地址是低位）
+3  BPF_JEQ  LOADER_BASE_HI        -> ALLOW : -> 4    // ★别漏
+4  BPF_LD   seccomp_data.nr
+...按 nr 分发...
+```
+
+**验证方法**（不依赖真机，模拟器上就能跑）：写一个自包含的 demo，
+BPF 只拦 `rt_sigprocmask`，handler 里再调一次 `rt_sigprocmask`：
+
+- 带 IP 白名单 → `HANDLER-SURVIVED-nested`、rc=0；
+- 去掉 IP 白名单 → `Bad system call`、rc=159。
+
+再把「guest 桩」`mmap` 到非 loader 基址（如 `0x5000000000`）执行，
+确认它**仍被 TRAP**（证明白名单只放行 loader、没把 guest 一起放行）——
+两者同时成立才算修对。
+
+**教训**：`strace` 对**嵌套** SIGSYS 是无能为力的，它只会显示外层那一层，
+于是现场看起来比真实位置早得多。定位这类问题不要靠「在哪一行停下」，
+要靠在 handler 里逐步加 `write` 打点（本方案 freestanding，`raw6(1,...)` 即可）。
+另外「最小复现」必须把 IP 白名单也带上，否则复现的是另一个问题。

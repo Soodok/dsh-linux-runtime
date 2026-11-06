@@ -1624,3 +1624,81 @@ if (f_w != (int)out_w || f_h != (int)out_h) {
 ```
 
 静默画出错位画面比直接失败难查得多。App 侧尺寸变化走重新映射的路径。
+
+---
+
+## #47 设备上运行的 runner 可能是旧二进制 —— `/dev/shm` 修复"看起来没生效"
+
+**症状**：源码里明明有 `/dev/shm` 处理（`is_shm_path()` + `is_host_passthrough()`
+排除），但容器内 `ls -ld /dev/shm` 仍然 `No such file or directory`，
+wlroots 继续刷 `[wlr] [render/swapchain.c:110] Failed to allocate buffer`。
+
+**根因**：设备上 `files/linux/runner/dsh_alpine` 是**旧的 48336 B 二进制**，
+而当前源码编出来的 x86_64 版是 **46976 B**。两者都不等于任何已提交版本的尺寸，
+说明设备上那份早就和源码脱节了。
+
+**判据（两条，都要做）**
+
+```sh
+# 1) 尺寸对不上就该怀疑
+adb shell ls -la /data/data/app.dsh.mobile/files/linux/runner/dsh_alpine
+# 2) 直接查字符串里有没有关键修复
+adb shell strings <runner> | grep -c '/dev/shm'      # 0 = 不含该修复
+```
+
+**修法**
+
+```sh
+cd dsh-linux-runtime
+NDK=$(ls -d /e/Android/Sdk/ndk/* | tail -1)
+bash build/build.sh "$NDK" build/libdsh_alpine-x86_64.so x86_64
+adb shell "am force-stop app.dsh.mobile; pkill -9 -f dsh_alpine; sleep 2"
+adb push build/libdsh_alpine-x86_64.so /data/local/tmp/newrunner
+# ★必须 rm -f 再 cp：直接 cp 覆盖正在运行/刚被杀的文件会报 Text file busy
+adb shell "rm -f .../runner/dsh_alpine; cp /data/local/tmp/newrunner .../runner/dsh_alpine"
+adb shell "chmod 755 .../runner/dsh_alpine; chown 10204:10204 .../runner/dsh_alpine"
+```
+
+**为什么这条值得单列**：`cp` 失败报的是 `Text file busy`，很容易当成权限问题；
+而即使 `cp` 成功，如果 `chown` 没跟上，App 进程（uid 10204）用不了 root 属主的
+runner。两个坑叠在一起，现象都只是"修复没生效"。
+
+**验证（修复后必须看到的三行）**
+
+```
+$ ls -ld /dev/shm
+drwxrwxrwt    2 root     root          4096 /dev/shm
+$ touch /dev/shm/t && echo SHM_WRITABLE
+SHM_WRITABLE
+# sway 启动日志里 swapchain 错误消失（只剩 Xwayland/swaybg 这两条无关的）
+```
+
+---
+
+## #48 抓合成画面必须让窗口活到抓帧那一刻
+
+**症状**：`wlwin` 打出 `WLWIN_KV committed=1 size=320x200`（窗口确实建了、
+buffer 也确实提交了），但 `wlshot` 抓到的帧**全黑**（`distinct colors = 1`，
+全 `(0,0,0)`）。
+
+**根因**：`wlwin` 默认 `hold = 3` 秒，画完第一帧就开始 `nanosleep`，然后
+`munmap` + 销毁 surface 退出。抓帧进程晚一步起来时窗口早已不存在 ——
+compositor 里没有 surface 可合成，输出自然是纯背景色。
+
+**修法**：给 `wlwin` 传足够长的持窗时间，抓帧在它存活期间进行。
+
+```sh
+/wlsrc/wlwin 20 >/tmp/wlwin.log 2>&1 &
+sleep 3                       # 等它 commit + 等 compositor 合成
+timeout 6 /wlsrc/wlshot /tmp/frame.bin 5000 --loop 3
+```
+
+**验证不能只看"有非黑像素"**：headless + pixman 下光标、背景都可能带色。
+判据是**窗口矩形内出现预期的像素**——本程序画的是 `x` 方向蓝→橙渐变，
+逐点采样应得 `x=5 → (2,89,253)`、`x=160 → (126,89,129)`、`x=315 → (250,89,5)`
+（RGBA 顺序）。渲染成 PNG 后肉眼确认渐变方向正确（左蓝右橙）。
+
+**顺带一个自己踩的坑**：把共享文件转 PNG 时若写成
+`bytes((px[i+2], px[i+1], px[i]))`，图会**左右反色**（蓝↔橙互换），
+看起来像 wlshot 抓错了字节序。共享文件本身就是 **RGBA** 顺序，
+转 PNG 直接取前三个字节即可，不要重排。

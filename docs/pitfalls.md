@@ -290,3 +290,124 @@ BPF 只拦 `rt_sigprocmask`，handler 里再调一次 `rt_sigprocmask`：
 于是现场看起来比真实位置早得多。定位这类问题不要靠「在哪一行停下」，
 要靠在 handler 里逐步加 `write` 打点（本方案 freestanding，`raw6(1,...)` 即可）。
 另外「最小复现」必须把 IP 白名单也带上，否则复现的是另一个问题。
+
+## 28. x86_64 上容器起得来、但 `ls /` 看到的是 Android 宿主的根目录
+
+**症状**：容器进程正常启动、`busybox echo` 正常、`sh -c` 正常，但
+`ls /etc` 列出的是 Android 的 `/etc`（`NOTICE.xml.gz`、`audio_effects.xml`…），
+`cat /tmp/x` 报 `No such file or directory`。没有任何报错，纯粹「翻译没生效」。
+
+**原因**：x86_64 **保留了** aarch64 通用 ABI 里根本没有的「老式」路径 syscall
+（`open`=2、`stat`=4、`lstat`=6、`access`=21、`unlink`=87、`mkdir`=83、
+`rename`=82、`chmod`=90…）。原实现只拦 `*at` 变体（`openat`/`newfstatat`/
+`faccessat`…），在 aarch64 上足够，在 x86_64 上则完全漏掉。
+
+strace 实证（容器内 `ls /etc`）：
+
+```
+stat("/etc", {st_mode=S_IFDIR|0755, st_size=4096, ...}) = 0
+open("/etc", O_RDONLY|O_LARGEFILE|O_CLOEXEC|O_DIRECTORY) = 5
+```
+
+两条都不在过滤器里 → 不 TRAP → 内核按原样执行 → 落到宿主根。
+
+**修法**：给 x86_64 的 BPF 树补上 15 个老式 syscall，并在 handler 里把它们
+**改写成对应的 `*at` 版本**（这样路径翻译、bind 映射、EBADF 重试全部复用）：
+
+| 老式 | 改写成 |
+|---|---|
+| `open(p,f,m)` | `openat(AT_FDCWD,p,f,m)` |
+| `stat(p,buf)` | `newfstatat(AT_FDCWD,p,buf,0)` |
+| `lstat(p,buf)` | `newfstatat(AT_FDCWD,p,buf,AT_SYMLINK_NOFOLLOW)` |
+| `access(p,m)` | `faccessat(AT_FDCWD,p,m,0)` |
+| `unlink(p)` | `unlinkat(AT_FDCWD,p,0)` |
+| `rmdir(p)` | `unlinkat(AT_FDCWD,p,AT_REMOVEDIR)` |
+| `mkdir(p,m)` | `mkdirat(AT_FDCWD,p,m)` |
+| `rename(o,n)` | `renameat(AT_FDCWD,o,AT_FDCWD,n)` |
+| `link(o,n)` | `linkat(AT_FDCWD,o,AT_FDCWD,n,0)` |
+| `symlink(t,l)` | `symlinkat(t,AT_FDCWD,l)` |
+| `chmod(p,m)` | `fchmodat(AT_FDCWD,p,m,0)` |
+| `chown(p,u,g)` | `fchownat(AT_FDCWD,p,u,g,0)` |
+| `truncate(p,l)` | `openat` + `ftruncate` |
+| `utime(p,t)` | `utimensat(AT_FDCWD,p,t,0)` |
+| `readlink(p,b,s)` | `readlinkat(AT_FDCWD,p,b,s)` |
+
+**为什么容易漏**：树是合法的、`seccomp()` 返回 0、编译通过、容器能起、
+`echo` 能跑 —— 只有真的去访问一个**绝对路径**才看得出问题。而且
+`tools/verify_bpf_semantics.py` 若也用 aarch64 的编号表，同样查不出来
+（它只会验证表内那些 syscall 的语义，不会问「宿主架构还多了哪些」）。
+所以这个脚本现在改成**按架构从 NDK 头文件取编号**，并另加一条
+「拿另一架构的 openat 编号来试，必须是 ALLOW」的交叉断言。
+
+## 29. x86_64 上 handler 一返回就 `SIGSEGV(SI_KERNEL, si_addr=NULL)`
+
+**症状**：装了 filter、SIGSYS 也确实投递到了 handler，但 handler 执行完
+准备返回时立刻 `--- SIGSEGV {si_code=SI_KERNEL, si_addr=NULL} ---`，
+进程被 SIGSEGV 杀掉。strace 里看着就像「handler 内部解引用了空指针」。
+
+**这个症状极具误导性**，我为此先后错改了四处（都不对）：
+
+1. 以为 `_start` 的段属性有问题（`.text` vs `.ltext`）；
+2. 以为 `sigaltstack` 的 `stack_t` 布局在 x86_64 上不同；
+3. 以为 `-mcmodel=large` 下裸汇编的重定位不对；
+4. 以为返回值写错了寄存器（这一条**确实是另一个真 bug**，见下，但
+   不是 `si_addr=NULL` 的原因）。
+
+**真正原因**：x86_64 的 `struct sigaction` 里 `sa_restorer` **必须**填有效
+地址，并且 `sa_flags` 要带 `SA_RESTORER`（0x04000000）。内核从这个地址
+恢复被信号打断的上下文；不给（=NULL）时 handler 一返回就跳到地址 0。
+aarch64 的通用 ABI 有 VDSO 版 restorer，所以原实现把 `sa+16` 留 0 也没事 ——
+换成 x86_64 就致命。
+
+**修法**：自己写一段裸汇编当 restorer，并把它填进 `sa+16`：
+
+```c
+__asm__(
+    ".text\n.p2align 4\n.globl __dsh_rt_sigreturn\n.hidden __dsh_rt_sigreturn\n"
+    ".type __dsh_rt_sigreturn,@function\n"
+    "__dsh_rt_sigreturn:\n  movq $15, %rax\n  syscall\n"     /* __NR_rt_sigreturn */
+    ".size __dsh_rt_sigreturn, .-__dsh_rt_sigreturn\n");
+/* ... */
+sa_flags = SA_SIGINFO | SA_NODEFER | SA_RESTORER;
+*(unsigned long *)(sa + 16) = (unsigned long)__dsh_rt_sigreturn;
+```
+
+**同一架构下的第二个必改点：返回值寄存器**
+
+aarch64 的 `x0` 既是第一个入参又是返回值，所以「把翻译结果写回 `r[0]`」
+两边都成立。x86_64 **入参在 `rdi`、返回在 `rax`**，只写回 `rdi` 的话
+guest 拿到的「返回值」其实是它自己的第一个参数，真正 `rax` 仍是 syscall 号。
+实测症状（容器内 `ls /etc`）：
+
+```
+stat("/etc", {st_mode=001, st_size=0, ...}) = 4
+```
+
+`st_mode=001`、返回值 `4` —— 全是垃圾。修法是 handler 末尾**先把入参
+写回 `rdi..r9`，再把 `r[0]` 写进 `rax`**。
+
+**这两条必须都改对才能跑**，只改一条仍是 SIGSEGV，很容易误以为「改了没用」。
+## 30. 软链接内容里的绝对路径不经过翻译（架构固有限制，非 bug）
+
+**症状**：容器内 `ln -s /etc/alpine-release /tmp/abs` 成功、`ls -l` 显示链接正确，
+但 `cat /tmp/abs` 报 `No such file or directory`。相对软链（`ln -s ../etc/x /tmp/rel`）
+则完全正常。
+
+**原因**：内核在处理路径的中间组件是软链接时，会**自己在内核态展开**链接内容，
+这发生在地址空间里、不产生新的 syscall，我们的 seccomp 过滤器根本收不到。
+于是链接内容里的 `/etc/alpine-release` 被内核按**宿主根**解析。
+这不是实现缺陷 —— 只要不用 chroot/namespace，任何纯 syscall 拦截方案
+（PRoot 同理）都有这个边界。
+
+**可行的规避**（按侵入性排序）：
+
+1. **优先用相对软链**。rootfs 内的系统级软链大多可以改写成相对形式，
+   这是零成本的正解。
+2. **对 rootfs 里必须绝对的地方做「实体化」**：把软链替换成真实文件或
+   硬链接（本项目实测 `/bin/sh` 就是 busybox 的实体副本，不是软链）。
+3. 若某个绝对软链非有不可，可以把它重写成「相对 cwd 的等价路径」——
+   前提是 cwd 可预期，一般不推荐。
+
+**诊断提示**：这类问题**不会**在 strace 里留下任何被拦记录（因为压根没有
+syscall）。看到「链接建成功、读不到」且 strace 里 `cat` 的 openat 参数是
+那个链接名本身，就该想到内核自己展开了。

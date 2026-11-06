@@ -57,6 +57,11 @@ int main(int argc, char **argv) {
 
     dsh_printf("DSH_GL pixmode=%s req=%s w=%d h=%d stride=%u\n",
                dsh_frame_pixmode_name(&f), mode, w, h, f.ahb_stride);
+    /* ★机器可解析的一行。不要指望调用方用 sed 分组去抠上面那行 ——
+       脚本在 toybox/busybox 下换行与转义差异极大，实测抠出来是空串，
+       而 grep 判据照样通过，形成「假通过」。这里直接给 KEY=VALUE。 */
+    dsh_printf("DSH_GL_KV pixmode=%s\n", dsh_frame_pixmode_name(&f));
+    dsh_printf("DSH_GL_KV req=%s\n", mode);
 
     void *gl = f.gl_lib;
     void (*pViewport)(int, int, int, int) = dlsym(gl, "glViewport");
@@ -83,12 +88,15 @@ int main(int argc, char **argv) {
 
     dsh_printf("DSH_GL present frames=%d ms=%.0f fps=%.1f\n",
                frames, el, frames * 1000.0 / el);
+    dsh_printf("DSH_GL_KV fps=%.1f\n", frames * 1000.0 / el);
+    dsh_printf("DSH_GL_KV frames=%d\n", frames);
 
     /* 中心像素：橙色 (255, 89, 26, 255) */
     {
         unsigned char *px = f.pixels;
         unsigned off = (unsigned)(h / 2) * (unsigned)w * 4u + (unsigned)(w / 2) * 4u;
         dsh_printf("DSH_GL center=%u,%u,%u,%u\n", px[off], px[off + 1], px[off + 2], px[off + 3]);
+        dsh_printf("DSH_GL_KV center=%u,%u,%u,%u\n", px[off], px[off + 1], px[off + 2], px[off + 3]);
         if (!(px[off] > 200 && px[off + 1] > 60 && px[off + 1] < 120 && px[off + 3] > 200)) {
             dsh_frame_close(&f);
             dsh_write("RESULT: DSH_GL_PIXMODE_FAIL pixel\n");

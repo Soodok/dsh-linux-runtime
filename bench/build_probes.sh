@@ -31,3 +31,8 @@ for ARCH in $ARCHS; do
   "$CC" -O2 -fPIC -o "$OUT/dsh_gl_pixmode"     "$HERE/../lib/pixmode_probe.c" "$HERE/../lib/dsh_gl.c" -ldl
   echo "  $ARCH/dsh_gl_pixmode  $(stat -c%s "$OUT/dsh_gl_pixmode") B"
 done
+# wlwin（Wayland 窗口客户端）是 **musl** 程序，必须在容器内用 gcc 编译，
+# 不能用 NDK 交叉编译（NDK 只有 bionic）。编译脚本见 scripts/build_wlwin.sh。
+echo ""
+echo "注意：bench/wlwin.c 需在容器内编译（musl + wayland-client），"
+echo "      见 scripts/build_wlwin.sh；它不在本脚本的 NDK 产物里。"

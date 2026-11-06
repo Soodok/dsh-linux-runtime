@@ -557,6 +557,69 @@ cmp /data/local/tmp/g_rpix.bin /data/local/tmp/g_ahb.bin   # 必须 IDENTICAL
 `stride` 实测 640 宽时为 640（无对齐余量），1024 宽时为 1024。真机上
 1080p 常见 1088/1152，所以库必须按行拷，不能整块 `memcpy`。
 
+### 6.10 容器内开真实 GUI 窗口（weston + xdg_toplevel）
+
+判据是三层，缺一层都不算开成（只看 weston 进程存活会假通过，见 pitfalls #43）：
+
+| 层 | 证据 |
+|---|---|
+| 1 | `wl_compositor` / `xdg_wm_base` / `wl_shm` 三个 global 都拿到 |
+| 2 | `xdg_surface.configure` —— compositor 对开窗请求的正式回应 |
+| 3 | `wl_surface_frame` 回调（`frame_callback >= 1`）—— 真的跑了一帧绘制 |
+
+```sh
+# 容器内一次性准备
+apk add --no-interactive weston weston-shell-desktop weston-backend-headless
+apk add --no-interactive wayland-dev wayland-protocols gcc musl-dev
+sh /build_wlwin.sh /wlsrc
+
+# 起 compositor 并开窗口
+rm -rf /tmp/wl; mkdir -p /tmp/wl; chmod 700 /tmp/wl     # 必须 0700
+XDG_RUNTIME_DIR=/tmp/wl weston --backend=headless-backend.so   --renderer=pixman --socket=wl-t1 --idle-time=0 &
+sleep 5
+cd /wlsrc && WAYLAND_DISPLAY=wl-t1 ./wlwin 3 320 200
+```
+
+实测输出（模拟器 dsh34 / x86_64 / Android 14）：
+
+```
+weston: Using Pixman renderer
+        Output 'headless' enabled with head(s) headless
+        launching '/usr/libexec/weston-desktop-shell'
+wlwin : WLWIN_KV compositor=4
+        WLWIN_KV xdg_wm_base=5
+        WLWIN_KV shm=1
+        WLWIN_KV configure=0x0
+        WLWIN_KV committed=1 size=320x200
+        WLWIN_KV frame_callback=1
+        RESULT: WLWIN_OK
+```
+
+两轮连续跑都拿到 `frame_callback=1`，可重复。
+
+### 6.11 图形栈的真实边界（llvmpipe vs 硬件）
+
+`--renderer=gl` 能起，但拿到的是软件渲染：
+
+```
+GL version: OpenGL ES 3.2 Mesa 25.1.9
+GL renderer: llvmpipe (LLVM 20.1.8, 256 bits)
+warning: failed to query rendering device from EGL
+failed to initialize allocator
+```
+
+根因：容器内 **没有 `/dev/dri`，也没有 `/dev/kgsl-3d0`**（模拟器上宿主本身
+这两个设备都不存在，`ls /dev/dri` 与 `ls /dev/kgsl-3d0` 均为空）。
+
+| 能力 | 状态 |
+|---|---|
+| 容器内开真实 GUI 窗口（compositor 合成、xdg_toplevel、frame 回调） | ✅ 实测 |
+| 容器内 GL 渲染 + 像素送回 App（`lib/dsh_gl`，AHB） | ✅ 实测，1080p 1.48× |
+| compositor 的 GL 合成走 GPU | ❌ 走 llvmpipe 软件渲染 |
+| 免 root 硬件合成（AHB/gralloc 零回读） | ❌ 需 libhybris fork |
+
+**不要把「窗口能开」说成「硬件加速窗口能开」** —— 这两件事差着一整条 libhybris。
+
 ### 能力边界
 
 | 项 | 状态 |

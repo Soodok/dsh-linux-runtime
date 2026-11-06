@@ -81,6 +81,48 @@ if [ -f "$T/gl_rpix.bin" ] && [ -f "$T/gl_ahb.bin" ]; then
   cmp -s "$T/gl_rpix.bin" "$T/gl_ahb.bin" && echo "  OK  rpix/ahb pixels IDENTICAL"     || { echo "  FAIL rpix/ahb pixels differ"; fail=$((fail+1)); }
 fi
 
+echo "=== 5) 开窗口（weston compositor + xdg_toplevel）==="
+# 这段验证的是「容器里能不能开真实 GUI 窗口」。
+# 判据不是「weston 进程起来了」，而是 **compositor 回了 xdg_surface.configure
+# 且来了 frame_callback** —— configure 是 compositor 对「你要开顶层窗口」的
+# 正式回应，frame_callback 证明它真的跑了一帧绘制循环。
+# 只看进程存活会误判：weston 起来但没有任何客户端连上时，进程也在。
+if [ ! -x "$F/wlsrc/wlwin" ]; then
+  echo "  SKIP rootfs 内没有 wlwin（先 apk add wayland-dev gcc musl-dev 并跑 build_wlwin.sh）"
+elif ! $R $M $F $I /bin/sh -c 'command -v weston >/dev/null' 2>/dev/null; then
+  echo "  SKIP rootfs 内没有 weston（apk add weston weston-shell-desktop weston-backend-headless）"
+else
+  out=$($R $M $F $I /bin/sh -c '
+    rm -rf /tmp/wl; mkdir -p /tmp/wl; chmod 700 /tmp/wl
+    export XDG_RUNTIME_DIR=/tmp/wl
+    weston --backend=headless-backend.so --renderer=pixman --socket=wl-v1 --idle-time=0 > /tmp/wv.log 2>&1 &
+    sleep 5
+    cd /wlsrc && WAYLAND_DISPLAY=wl-v1 ./wlwin 3 320 200 2>&1
+    kill %1 2>/dev/null
+  ' 2>&1)
+  echo "$out" | grep -q "RESULT: WLWIN_OK"     || { echo "  FAIL 窗口客户端失败"; echo "$out" | tail -4; fail=$((fail+1)); }
+  cfg=$(echo "$out" | grep "^WLWIN_KV configure=" | cut -d= -f2)
+  fc=$(echo "$out" | grep "^WLWIN_KV frame_callback=" | cut -d= -f2)
+  # 空值必须判 FAIL：解析坏了还判 OK 就是假通过
+  if [ -z "$cfg" ] || [ -z "$fc" ]; then
+    echo "  FAIL configure/frame_callback 未解析出"; fail=$((fail+1))
+  elif [ "$fc" -lt 1 ] 2>/dev/null; then
+    echo "  FAIL frame_callback=$fc（compositor 没跑绘制循环）"; fail=$((fail+1))
+  else
+    echo "  OK  窗口开出：configure=$cfg frame_callback=$fc"
+  fi
+  # 顺带记录 GL renderer 是硬件还是软件 —— 这是图形栈的真实边界
+  gl=$(echo "$out" | grep -c WLWIN_OK)
+  rend=$($R $M $F $I /bin/sh -c '
+    rm -rf /tmp/wl2; mkdir -p /tmp/wl2; chmod 700 /tmp/wl2
+    export XDG_RUNTIME_DIR=/tmp/wl2
+    weston --backend=headless-backend.so --renderer=gl --socket=wl-g1 --idle-time=0 > /tmp/wg.log 2>&1 &
+    sleep 5; kill %1 2>/dev/null
+    grep -oE "GL renderer: .*" /tmp/wg.log | head -1
+  ' 2>&1 | tr -d "")
+  [ -n "$rend" ] && echo "  INFO $rend"
+fi
+
 echo
 [ $fail -eq 0 ] && echo "RESULT: VERIFY_CONTAINER_OK" || echo "RESULT: VERIFY_CONTAINER_FAIL ($fail)"
 exit $fail

@@ -1255,3 +1255,99 @@ const char *dsh_frame_pixmode_name(const dsh_frame *f);
 
 App 侧不受影响（`LinuxFrameSurface` 传的本来就是
 `/data/data/<pkg>/files/dshframe.bin`，本身就是宿主路径）。
+
+---
+
+## #43 在容器里开真实 GUI 窗口：判据不能是「weston 进程起来了」
+
+### 背景
+
+容器里能跑 weston 早已验证过（pitfalls #36），但「compositor 进程在」和
+「真的有窗口开出来」是两件事。weston 起来后没有任何客户端连上时，进程也活着，
+日志也正常 —— 只看进程存活会**假通过**。
+
+### 正确判据（三层，缺一层都不算开成）
+
+| 层 | 证据 | 为什么不能省 |
+|---|---|---|
+| 1 | `xdg_wm_base` / `wl_compositor` / `wl_shm` global 都拿到 | 只拿到 compositor 没有 wm_base 就开不了顶层窗口 |
+| 2 | `xdg_surface.configure` 事件 | compositor 对「你要开顶层窗口」的**正式回应**，不是本地日志 |
+| 3 | `wl_surface_frame` 回调（`frame_callback >= 1`） | 证明 compositor 真的跑了一帧绘制循环，不只是收下请求 |
+
+### 探针 `bench/wlwin.c`
+
+为什么不直接用现成的：
+- **foot** 需要字体（Alpine 容器没有 monospace）和 `wl_seat`（headless 后端不提供），
+  实测 `err: fcft.c:564: monospace::size=8: failed to match font`、
+  `err: wayland.c:1735: no seats available (wl_seat interface too old?)`
+- **weston-simple-shm** 在 Alpine 没有对应包（查证：`weston-demo` 包不存在，
+  `weston` 包里只有 `usr/bin/weston` 一个可执行）
+
+所以自己写一个只依赖 `wayland-client` + `xdg-shell` 的最小客户端：连 compositor →
+`wl_shm` 造 buffer → `xdg_toplevel` 设标题 → attach → commit → 等 configure + frame。
+
+**必须在容器内编译**（musl），不能用 NDK（只有 bionic）。见 `scripts/build_wlwin.sh`：
+
+```sh
+apk add --no-interactive wayland-dev wayland-protocols gcc musl-dev
+apk add --no-interactive weston weston-shell-desktop weston-backend-headless
+sh /build_wlwin.sh /wlsrc      # 生成 xdg-shell/presentation-time 协议代码并 gcc 编译
+```
+
+### 实测（模拟器 dsh34 / x86_64 / Android 14）
+
+```
+weston: Using Pixman renderer / Output 'headless' enabled with head(s) headless
+        launching '/usr/libexec/weston-keyboard'
+        launching '/usr/libexec/weston-desktop-shell'
+wlwin : WLWIN_KV compositor=4
+        WLWIN_KV xdg_wm_base=5
+        WLWIN_KV shm=1
+        WLWIN_KV configure=0x0        ← configure 是 compositor 回的
+        WLWIN_KV committed=1 size=320x200
+        WLWIN_KV frame_callback=1     ← compositor 真的跑了一帧
+        RESULT: WLWIN_OK
+```
+
+两轮连续跑都拿到 `frame_callback=1`，可重复。
+
+### 四个踩过的坑
+
+1. **`xdg_toplevel` v4+ 必须提供全部 listener**。只给 `configure` + `close` 时
+   libwayland 收到 opcode 3（`configure_bounds`）直接
+   `listener function for opcode 3 of xdg_toplevel is NULL` / `Aborted` / `rc=134`。
+   绑定版本 5 就要把 `configure_bounds` 与 `wm_capabilities` 都填上。
+
+2. **`XDG_RUNTIME_DIR` 权限必须是 0700 且属主为本 uid**。`0777` 时 weston 只打
+   warning 但仍会失败在后续，症状是 socket 建不出来。先
+   `mkdir -p /tmp/wl && chmod 700 /tmp/wl`。
+
+3. **headless 后端默认 renderer 是 `noop`**（帮助原文 "No-op renderer for testing only"），
+   只走合成不算像素。要 `--renderer=pixman` 才有真实 SHM buffer。
+   （#36 已记过一次，这里再确认一遍，因为它同时影响窗口验证。）
+
+4. **`wp_presentation` 的 `presented` 事件在 headless+pixman 下不发**
+   （实测 `presented=0`，即使已挂 feedback 且窗口真的合成了）。
+   所以判据要用 `frame_callback`（所有后端都给），不能只等 `presented`。
+   `wp_presentation` 绑定本身仍值得留着 —— 真机 DRM 后端会发。
+
+### ★图形栈的真实边界（必须诚实分列）
+
+`--renderer=gl` 在容器里能起，但拿到的是：
+
+```
+GL version: OpenGL ES 3.2 Mesa 25.1.9
+GL renderer: llvmpipe (LLVM 20.1.8, 256 bits)     ← 软件渲染
+warning: failed to query rendering device from EGL
+failed to initialize allocator
+```
+
+原因：容器内 **没有 `/dev/dri`，也没有 `/dev/kgsl-3d0`**（模拟器上宿主本身这两个
+设备都不存在）。所以：
+
+- ✅ 容器内能开真实 GUI 窗口（compositor 合成、xdg_toplevel、frame 回调）
+- ✅ 容器内能用 GL 渲染并把像素送回 App（`lib/dsh_gl`，AHB 路径，见 #42）
+- ⬜ **compositor 的 GL 合成走 llvmpipe 软件渲染**，不是 GPU
+- ❌ 免 root 拿到硬件合成（AHB/gralloc 零回读）仍需 libhybris fork（#41 的环境级限制）
+
+**不要把「窗口能开」说成「硬件加速窗口能开」** —— 这两件事差着一整条 libhybris。

@@ -1702,3 +1702,82 @@ timeout 6 /wlsrc/wlshot /tmp/frame.bin 5000 --loop 3
 `bytes((px[i+2], px[i+1], px[i]))`，图会**左右反色**（蓝↔橙互换），
 看起来像 wlshot 抓错了字节序。共享文件本身就是 **RGBA** 顺序，
 转 PNG 直接取前三个字节即可，不要重排。
+
+---
+
+## #49 读 node 二进制"前 64KB 找版本号"——这条从来没成功过
+
+**背景**：编译缓存目录名是 `v<node版本>-<process.arch>-<hash>-0`。要知道"当前该用哪个
+版本目录"，代码里有两个地方需要版本号：`pruneCompileCache`（清陈旧）和
+`seedCompileCache`（解预置包）。
+
+**当时的做法**：打开 node 二进制，读**前 64 KB**，正则找 `X.Y.Z`。理由听起来很合理 ——
+"冷启路径不能多一次 fork，那就静态读文件头"。
+
+**实测它一次都没成功过**：
+
+| 二进制 | 大小 | 首个版本串偏移 |
+|---|---|---|
+| `engine/bin/node`（v24.18.0） | 44.8 MB | **10 283 052** |
+| `distros/alpine/usr/bin/node`（v22.23.4） | 55.7 MB | **36 802 442** |
+
+两者都远在 64 KB 之外。ELF 头部里只有 `ELF`、`GNU`、interp 路径这类字符串，
+根本没有版本号。于是 `version` 恒为 `null`，两个函数都在 `?: return` 处静默退出。
+
+**后果（两条，都很隐蔽）**
+
+1. `pruneCompileCache` 一直是**死代码** —— 缓存目录只增不减，这就是"根下堆了
+   6 个版本目录 / 46MB / 5577 文件"的真正成因（当时误判成 Node 自己不清）。
+2. `seedCompileCache` 从不执行 —— 加了一堆日志才看清是"进去就 return 了"。
+
+**正确来源**：预置包里的那一级目录名。它是 **Node 自己**写出来的
+（`process.version` + `process.arch`），打包时原样保留。读 zip 第一个 entry 的
+名字即可（几十字节）：
+
+```kotlin
+val first = ZipInputStream(assets.open("linux/node-compile-cache.zip")).use {
+    it.nextEntry?.name
+} ?: return null
+val top = first.substringBefore('/')          // v24.18.0-x64-cf738c9d-0
+if (top.startsWith("v") && top.count { it == '-' } >= 3) top else null
+```
+
+零 fork、零大文件扫描，冷启路径的两条约束都满足。
+
+**顺带一个反例**：`endsWith("-x64")` 判断 arch 也是错的 —— 目录名结尾是 `-0`
+（计数器），不是 arch。arch 在**第 2 段**：`want.split('-').getOrNull(1)`。
+这个错误会让函数在 arch 检查处静默退出，症状与"版本读不到"完全一样。
+
+**诊断提示**：这类"代码看着对、日志里什么都没有"的问题，第一件事是在函数**入口**
+打一条必然打印的日志。不要先怀疑条件是"偶尔不满足"——先确认函数到底有没有被调用。
+
+---
+
+## #50 gradle assembleDebug 说 BUILD SUCCESSFUL 但 APK 没更新
+
+**症状**：改了 Kotlin 源码 → `gradle :app:assembleDebug` 报 `BUILD SUCCESSFUL in 5s` →
+`adb install -r` 报 `Success` → 但新加的日志在 logcat 里**一条都不出现**。
+
+**排查过程（走了弯路）**
+
+1. 先怀疑 logcat 缓冲（`-s TAG` 过滤、`-v brief` 全量）—— 不是。
+2. 再怀疑日志级别（`Log.i` 应该可见）—— 不是。
+3. 最后把设备上的 APK 拉回来，`unzip -p base.apk classes*.dex | strings | grep "seed cache"`
+   → **0 命中**；本地构建产物 `app/build/outputs/apk/debug/app-debug.apk` 里 → 1 命中。
+   两边 md5 不同，且**本地 APK 的 mtime 还是上一次的时间**。
+
+**根因**：`assembleDebug` 相对"它自己的 up-to-date 判定"认为没有变化，直接跳过了
+打包阶段。它报了 SUCCESS，但产物文件根本没被重写。这类"成功但没做事"的情况，
+只看退出码和 `BUILD SUCCESSFUL` 是发现不了的。
+
+**修法**：当**APK 本身就是被测对象**时，一律加 `--rerun-tasks`：
+
+```sh
+gradle :app:assembleDebug -Pabi=x86_64 -Ppackage=noruntime --rerun-tasks
+# 然后必须核对产物确实换了：
+unzip -p app/build/outputs/apk/debug/app-debug.apk classes*.dex | strings | grep "<新日志字符串>"
+```
+
+**教训**：`BUILD SUCCESSFUL` + `adb install Success` 不等于"新代码在跑"。
+验证链上必须有一环直接检查**产物内容**（dex 里的字符串、APK 里的 asset 尺寸、
+mtime），否则会在旧包上反复测出假结论 —— 这一轮为此白跑了四次部署。

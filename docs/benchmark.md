@@ -725,3 +725,93 @@ spill-local: Error: ENOENT: no such file or directory,
 下一步要砍的不是缓存，而是那 3.4 秒的构成。已知线索（前几轮 profile）：
 `ModuleWrap` 占 13.8%、`GC` 81.5ms、`compileSourceTextModule` 62.2ms，
 而 `(idle)` 只占 1.4% —— **说明不是等 IO，是真的在算**。
+
+## 13. 冷启 3.4 秒的精确构成（--cpu-prof 截到就绪时刻）
+
+### 一、先说一个被证伪的候选
+
+`--no-warnings`：交替 4 轮，中位 3416.3 vs 基线 3402.1，**差 14.2 ms**，
+两组数据完全重叠（A: 3285.8/3308.2/3496.1/3832.6，B: 3314.9/3406.3/3426.3/3881.6）。
+**判定噪声，不采用。** 这条记下来是为了避免以后有人再试一次。
+
+### 二、profile 怎么取（关键：必须按时间截到就绪点）
+
+`--cpu-prof` 的 profile 覆盖**整个进程生命周期**。如果只是起引擎、等 20 秒、
+再 `kill -TERM`，profile 里会包含就绪后的等待时间，`(idle)` 会虚高到 68%，
+结论完全错。
+
+正确做法：用 `timeDeltas` 累加到「`readyat` 那一刻」为止：
+
+```python
+READY_US = 4247 * 1000          # readyat 打印的 ms
+cum = 0
+sel = []
+for i, sid in enumerate(profile['samples']):
+    cum += profile['timeDeltas'][i]
+    if cum <= READY_US:
+        sel.append(sid)
+```
+
+这样得到 541 个样本（总 1795），覆盖 4247ms。
+
+### 三、4247ms 归谁在算
+
+| 归谁 | 占比 | 折算 |
+|---|---|---|
+| **node 内建（JS 层）** | **44.7%** | **1900 ms** |
+| **dsh 插件代码** | **36.8%** | **1562 ms** |
+| 第三方 `node_modules` | 11.8% | 502 ms |
+| GC | 5.9% | 251 ms |
+| idle/program | 0.7% | 31 ms |
+
+**`idle` 只占 0.7%** —— 这是最重要的一条：**不是在等 IO，是真的在算。**
+
+### 四、node 内建那 1900ms 的细分
+
+| 模块 | 占比 | 折算 |
+|---|---|---|
+| `internal/modules/cjs/loader` | 5.7% | 243 ms |
+| `node:fs` | 5.2% | 220 ms |
+| `internal/modules/esm/utils` | 5.0% | 212 ms |
+| `internal/bootstrap/realm` | 4.3% | 181 ms |
+| `internal/modules/package_json_reader` | 3.5% | 149 ms |
+| `internal/url` | 3.1% | 133 ms |
+| `internal/modules/esm/resolve` | 2.2% | 94 ms |
+| `internal/path` | 1.7% | 71 ms |
+
+**模块解析基础设施合计约 1.1 秒**（loader + fs + esm/utils + package_json_reader
++ url + esm/resolve + path）。这些是「找文件、读 package.json、构造 URL」
+的开销，与具体业务无关。
+
+### 五、dsh 插件那 1562ms 的细分（TOP 6）
+
+| 包 | 占比 | 折算 |
+|---|---|---|
+| **`cordis`（依赖注入/插件框架本体）** | **12.9%** | **548 ms** |
+| `dsh-app-boot` | 4.3% | 183 ms |
+| `cordis-plugin-loader` | 3.1% | 132 ms |
+| `dsh-tools` | 3.1% | 132 ms |
+| `schemastery`（配置 schema 校验） | 2.0% | 85 ms |
+| `libreoffice-kit` | 1.1% | 47 ms |
+
+`cordis` 内部再细分：`get`(proxy 读) 149ms / 匿名 94ms / `notify` 39ms /
+`execute` 39ms / `apply` 39ms / `plugin` 31ms / `createTraceable` 31ms。
+
+**`cordis` + `schemastery` + `cordis-plugin-loader` 合计 765ms 是插件框架本身的
+开销**，不是任何具体插件的业务逻辑。
+
+### 六、结论：剩下 2.4 秒该往哪砍
+
+当前 3.42 秒（缓存命中），要到 1.0 秒需砍掉 2.4 秒。按上面的分布：
+
+| 可砍方向 | 上限 | 现实性 |
+|---|---|---|
+| 插件框架开销（cordis/schemastery/loader） | ~765 ms | 中——属上游，改它要 patch 引擎 |
+| 模块解析基础设施（loader/fs/esm/package_json） | ~1100 ms | 低——是 Node 自己的路径，除非换加载器 |
+| dsh 各插件的启动逻辑 | ~800 ms | 中——可裁非必需插件（Tier1 已盘点 16 个） |
+| GC | ~251 ms | 低——由分配量决定 |
+| 第三方模块 | ~502 ms | 低 |
+
+**关键判断**：即使把插件框架和模块解析全砍掉，也只能到约 1.5 秒。
+**1.0 秒需要换掉加载模型（如 SEA / 单文件打包），不是调参数能到的。**
+这条结论写在这里，避免后续再在「调 flag / 裁插件」上反复尝试。

@@ -386,3 +386,49 @@ Canvas，`drawBitmap` 走 CPU 逐像素合成，720p 一次 12.7 ms；换
 `lastSeq=-1475936256`、`1057488896`、`-418906112` 这类乱数，于是**每帧都被
 判成新帧**，重复帧也要白拷一次整帧（1080p 是 8.3 MB）。修正后 lastSeq
 变成正常单调递增（6002 → 6719）。
+
+## 7. 路径语义三件套（realpath / inotify / getcwd）
+
+这三条 syscall 都不在最初的 BPF 树里，症状全都表现为「某个插件起不来」，
+离根因极远。一次全跑耗时 < 20ms，建议每次改 path 相关代码后跑一遍。
+
+```sh
+# 编译（x86_64 示例；aarch64 换 toolchain 前缀即可）
+x86_64-linux-android28-clang -O1 -static -o path_probe bench/path_probe.c
+
+# 跑（必须经 sh -c，直调会按 musl 装载）
+dsh_alpine -m /dsh:<home> -m /eng:<engine> <rootfs> \
+  /lib/ld-musl-x86_64.so.1 /bin/sh -c '/path_probe'
+```
+
+实测（模拟器 dsh34 / Android 14 / x86_64）：
+
+```
+--- realpath ---
+realpath(/) = /        realpath(/tmp) = /tmp     realpath(/dsh) = /dsh
+realpath(/eng) = /eng  realpath(/ws) = /ws
+--- inotify ---
+inotify_add_watch(/) = OK     inotify_add_watch(/tmp) = OK
+inotify_add_watch(/dsh) = OK  inotify_add_watch(/eng) = OK
+inotify_add_watch(/ws) = OK
+--- getcwd ---
+chdir(/) -> getcwd = /          chdir(/tmp) -> getcwd = /tmp
+chdir(/dsh) -> getcwd = /dsh    chdir(/eng) -> getcwd = /eng
+chdir(/ws) -> getcwd = /dsh/workspaces
+
+RESULT: PATH_PROBE_OK (fails=0)
+```
+
+> `chdir(/ws)` 回 `/dsh/workspaces` 不是 bug：`/ws` 与 `/dsh/workspaces` 是
+> 同一个宿主目录的两条 bind 名，`host_to_guest` 按最长宿主前缀反查，两条都
+> 合法。两者都能访问到同一个目录。
+
+### 修复前后的端到端差异
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| `realpath("/dsh")` | ENOENT | `/dsh` |
+| `fs.watch("/dsh/profiles/web")` | ENOENT → 回退到 `/` → EACCES | OK |
+| 引擎启动 | `startup failed: 2 required plugins did not activate` | 只有一行 `dsh web:` |
+| profile 健康 | 7 个服务 missing | 全绿 |
+| 首页 | 无 | HTTP 200 / 46437 B / 70 个客户端插件 |

@@ -35,6 +35,15 @@ NEEDED = [
     "rt_sigaction", "rt_sigprocmask", "clone", "execve", "renameat2",
     "execveat", "statx", "sendto", "sendmsg", "recvfrom", "recvmsg",
     "connect", "openat2", "faccessat2",
+    # ★inotify_add_watch(fd, pathname, mask) —— pathname 在 a1，没有 *at 变体。
+    #
+    #   不拦它的后果（实测）：Node 的 fs.watch 走 inotify_add_watch，guest 传的是
+    #   `/dsh/profiles/web`，内核按**宿主**根解析 → ENOENT。chokidar 收到 ENOENT
+    #   后会沿父目录逐级回退找「最近存在的目录」，最后退到 `/`，于是爆
+    #   `EACCES: permission denied, watch '/'`，dsh-hmr 插件激活失败，
+    #   整个引擎 `startup failed: 2 required plugins did not activate`。
+    #   症状离根因极远：日志里只有 watch('/')，看不到任何路径翻译线索。
+    "inotify_add_watch",
 ]
 
 # ★x86_64 独有的「老式」路径 syscall。

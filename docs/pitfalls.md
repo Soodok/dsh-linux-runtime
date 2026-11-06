@@ -548,3 +548,130 @@ App 自己起的容器：  cat /proc/<apppid>/cgroup → memory:/ cpuset:/top-ap
 **用户不用去开发者选项关任何东西**，这是能写进对比表的实打实差异。
 
 **但这只是推测，必须真机验证后才能当结论用。**
+
+## 34. `realpath()` 在 bind 挂载点下全部失败 —— 整条引擎起不来
+
+**症状**：手工起引擎时报
+
+```
+hmr (@deepseek-ai/dsh-hmr): Error: EACCES: permission denied, watch '/'
+dsh: startup failed: 2 required plugins did not activate
+```
+
+同时 `[android-plugin-health] profile is degraded: missing=typert,typertGateway,
+directoryPicker,directoryPickerController,workspaceRegistry,workspaceController,
+webServer,loader failed=...`（7 个服务全 missing）。
+
+**这条坑最贵的地方在于症状离根因极远**：日志里只有 `watch '/'`，看不到任何
+「路径没翻译」的线索。而 `/` 是 chokidar 沿父目录逐级回退的**终点**，不是起点。
+
+### 定位方法（可复用）
+
+用 `--require` 给 `fs.watch` 打桩，把每次调用的真实入参打出来：
+
+```js
+const fs = require("node:fs");
+const orig = fs.watch;
+fs.watch = function (target, options) {
+  fs.writeSync(2, "[watchhook] watch(" + target + ", cwd=" +
+    (options && options.cwd ? options.cwd : "-") + ")\n");
+  try { return orig.apply(this, arguments); }
+  catch (e) { fs.writeSync(2, "[watchhook] THROW " + target + " :: " + e.code + "\n"); throw e; }
+};
+```
+
+实测输出（全部 ENOENT）：
+
+```
+[watchhook] watch(/dsh/profiles/web)                        -> ENOENT
+[watchhook] watch(/dsh/profiles/web/cordis.patch.yml)        -> ENOENT
+[watchhook] watch(/dsh/.credentials.yaml)                    -> ENOENT
+[watchhook] watch(/dsh)                                      -> ENOENT
+```
+
+**链条**：`fs.watch` → `inotify_add_watch` 收到 guest 路径 → 内核按**宿主**根解析
+→ ENOENT → chokidar 沿父目录回退到 `/` → `EACCES, watch '/'` → dsh-hmr 激活失败
+→ 依赖 `webServer` 的 `web-runtime` / `open-in-app` / `client-hmr` 一起挂 → 整条
+startup 判死。
+
+### 原因一：`realpath()` 的 musl 实现依赖 `/proc/self/fd`
+
+musl 的 `realpath()` 走 `open(path, O_PATH)` + `readlink("/proc/self/fd/N")`。
+而 `/proc` 整棵前缀是**透传给宿主**的（`is_host_passthrough`），所以 `readlink`
+返回的是**宿主机真实路径**：
+
+| guest 路径 | readlink 实际返回 |
+|---|---|
+| `/tmp` | `/data/data/app.dsh.mobile/files/linux/distros/alpine/tmp` |
+| `/dsh` | `/data/data/app.dsh.mobile/files/dsh-home` |
+
+`realpath()` 拿到后还要 `stat` 这条宿主路径 —— 容器里不存在，于是 ENOENT。
+**任何** bind 挂载点下的 `realpath` 全失败，不只是 hmr 用的路径。
+
+**修法**：在 `SYS_readlinkat` 分支里识别 `/proc/[self|PID]/fd/N`，把内核返回的
+宿主路径反查成 guest 路径：
+
+```c
+if (nr == SYS_readlinkat && a0 == -100 && is_proc_self_fd(path)) {
+    long rvf = raw6(nr, -100, (long)path, (long)a2, (long)a3, 0, 0);
+    if (rvf > 0) {
+        int n2 = host_to_guest((char *)a2, (int)rvf);   // bind 表反查，再退 rootfs 前缀
+        if (n2 >= 0) rvf = n2;
+    }
+    r[0] = (unsigned long long)rvf;
+    return;
+}
+```
+
+`host_to_guest()` 的顺序是**先 bind 表反查（最长匹配）再 rootfs 前缀裁剪** ——
+和 `getcwd` 那边同一个道理：只裁 rootfs 前缀对 bind 目录无效。
+
+### 原因二：`inotify_add_watch` 没进 BPF 树
+
+`inotify_add_watch(fd, pathname, mask)` 的路径在 **a1**，而且**没有 `*at` 变体**
+（内核只给了这一个入口）。原树只拦 `*at` 一族，这一条被透明转发，guest 路径
+直接落到宿主根。
+
+**修法**：加进 `tools/gen_bpf_tree.py` 的 `NEEDED`，并在 handler 里像 `statfs`
+那样用 `make_host()` 拼宿主绝对路径：
+
+```c
+case SYS_inotify_add_watch: {
+    const char *ip = (const char *)a1;
+    if (ip && ip[0] == '/' && !is_host_passthrough(ip)) {
+        char ib[PATH_MAX];
+        if (bind_map(ip, ib)) { r[0] = raw6(SYS_inotify_add_watch, a0, (long)ib, a2, 0,0,0); return; }
+        make_host(ib, ip);
+        r[0] = (unsigned long long)raw6(SYS_inotify_add_watch, a0, (long)ib, a2, 0, 0, 0);
+        return;
+    }
+    r[0] = (unsigned long long)raw6(nr, a0, (long)ip, a2, 0, 0, 0);
+    return;
+}
+```
+
+inotify 在**宿主路径**上注册不影响事件回传：wd 只跟 inode 走，与打开的路径无关。
+
+### 验证
+
+```sh
+# 1) realpath 全通
+node -e 'const {realpathSync}=require("node:fs");
+for (const p of ["/","/dsh","/dsh/profiles/web","/eng","/ws","/tmp"])
+  console.log(p, "->", realpathSync(p));'
+# / -> /   /dsh -> /dsh   /dsh/profiles/web -> /dsh/profiles/web   /eng -> /eng ...
+
+# 2) fs.watch 全通
+node -e 'const {watch}=require("node:fs");
+for (const p of ["/dsh/profiles/web","/eng","/tmp"]) {
+  try { watch(p,{persistent:false},()=>{}).close(); console.log("OK", p); }
+  catch(e){ console.log("FAIL", p, e.code); } }'
+# WATCH-OK /dsh/profiles/web    WATCH-OK /eng    WATCH-OK /tmp
+
+# 3) 引擎完整启动（修复前 startup failed，修复后只有一行）
+# dsh web: http://127.0.0.1:3080/?token=...
+```
+
+**修复前后对比**：修复前 `dsh: startup failed: 2 required plugins did not activate`
++ 7 个服务 missing；修复后日志**只有一行** `dsh web:`，首页 46437 字节、
+70 个客户端插件全部入 boot manifest。

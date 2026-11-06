@@ -667,3 +667,61 @@ awk "BEGIN{printf \"%.2f ms/run\", ($E-$S)*1000/20}"
 - **`/proc/uptime` 只有 10ms 粒度**：单次测量全 0，必须批平均。
 - **toybox `date +%s%N` 不支持纳秒**：返回 0ms。
 - **App 不在前台会被 ActivityManager 杀**（adj 0）：见 pitfalls #38。
+
+## 12. 编译缓存实测省 1.1 秒（24%）—— 且之前那条 6197ms 是污染的
+
+冷启优化里唯一还有正收益的一项。这轮做了干净的 A/B。
+
+### 实验设置（模拟器 dsh34 / Android 14 / x86_64，bionic node v24.18.0）
+
+- 同一份引擎、同一份 profile（只剩 `@deepseek-ai/dsh-base` + `dsh-web-app`）
+- 同一 `NODE_COMPILE_CACHE` 目录、同一 `--require readyat.cjs`（在
+  `console.log("dsh web: ...")` 那一刻读 `process.uptime()`）
+- **每轮之间清场**：`kill -9` 所有 `node` / `dsh_alpine` / `dsh-alpine`，
+  再 `sleep 3`；端口必须真空（否则 `EADDRINUSE` 直接失败）
+- 无缓存态：每轮开始前 `rm -rf .node-compile-cache`
+
+### 结果（各 3 轮）
+
+| 状态 | 三轮 | 中位 |
+|---|---|---|
+| **缓存命中** | 3652.2 / 3416.8 / 3385.7 ms | **3416.8 ms** |
+| **缓存清空** | 4540.2 / 4088.8 / 4528.4 ms | **4528.4 ms** |
+
+**省 1111.6 ms / 24.5%。**
+
+缓存落盘量：**15 MB**（`v24.18.0-x64-cf738c9d-0` 一个目录）。
+
+### 关键前提：必须有 flusher，否则缓存等于不存在
+
+`NODE_COMPILE_CACHE` 是**懒写盘**的 —— 实测不注入
+`node-compile-cache-flusher.cjs` 时，跑完一整轮缓存目录只有 **16 KB**
+（vs 注入后 15 MB）。原生启动路径早就注入了这个 flusher
+（`EngineConfig.kt` 的 `COMPILE_CACHE_FLUSHER`），所以这条优化**在原生路径上
+一直生效**；容器路径也注入了（`LinuxEngineLauncher.kt:256`）。
+
+### 顺带纠正一条被污染的历史数字
+
+之前记的「原生引擎 6197 ms」是**不可用**的：那一轮的 `TMPDIR` 指向一个不存在
+的目录，`spill-local` 插件报
+
+```
+spill-local: Error: ENOENT: no such file or directory,
+  mkdtemp '/data/data/app.dsh.mobile/files/dsh-home/tmp/dsh-spill-XXXXXX'
+```
+
+（`dsh: warning: 1 entry did not activate`），运行环境与生产不一致。
+`mkdir -p $TMPDIR` 之后重测，无缓存态是 4089~4540 ms。
+
+**教训**：`TMPDIR` 必须真实存在且可写，否则 `spill-local` 起不来，
+整个测量不可比。
+
+### 与 1.0 秒目标的距离
+
+即使缓存全命中，**中位 3.42 秒**，距 1.0 秒还差 **2.4 秒**。
+这条数据的作用是**收窄范围**：它证明还有 1.1 秒是「第一次编译模块」，
+剩下 3.4 秒里必定是别的东西（插件激活 / ESM 解析 / 依赖图构建）。
+
+下一步要砍的不是缓存，而是那 3.4 秒的构成。已知线索（前几轮 profile）：
+`ModuleWrap` 占 13.8%、`GC` 81.5ms、`compileSourceTextModule` 62.2ms，
+而 `(idle)` 只占 1.4% —— **说明不是等 IO，是真的在算**。

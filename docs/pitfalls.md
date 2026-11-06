@@ -1351,3 +1351,104 @@ failed to initialize allocator
 - ❌ 免 root 拿到硬件合成（AHB/gralloc 零回读）仍需 libhybris fork（#41 的环境级限制）
 
 **不要把「窗口能开」说成「硬件加速窗口能开」** —— 这两件事差着一整条 libhybris。
+
+---
+
+## #44 Android 宿主没有 `/dev/shm` —— 所有 POSIX 共享内存程序都会静默失败
+
+### 症状（三层，每层都指向完全不同的方向）
+
+**第一层：wlroots 反复报 buff 分配失败**
+
+```
+[wlr] [render/allocator/shm.c:118] Created shm allocator        ← 分配器创建成功
+[DEBUG] [wlr] [render/swapchain.c:106] Allocating new swapchain buffer
+[ERROR] [wlr] [render/swapchain.c:110] Failed to allocate buffer
+[ERROR] [sway/config/output.c:887] Requested backend configuration failed, searching for valid fallbacks
+```
+
+`Created shm allocator` 明明成功了，下一行分配就失败 —— 会以为是
+wlroots 的 bug、DRM 缺失、或者 swapchain 参数不对。
+
+**第二层：sway 起得来，但截图全空**
+
+```
+swaymsg -t get_outputs        → HEADLESS-1, width 1280, height 720   ← output 建出来了
+grim -o HEADLESS-1 shot.png   → failed to copy output HEADLESS-1
+```
+
+**第三层：点了半天才找到 —— 宿主的 /dev/shm 根本不存在**
+
+```sh
+adb shell ls -ld /dev/shm
+# ls: /dev/shm: No such file or directory
+adb shell mount | grep ' /dev '
+# tmpfs on /dev type tmpfs (rw,seclabel,nosuid,relatime,mode=755)
+```
+
+### 根因
+
+容器把 `/dev` **整棵前缀透传**给宿主（为了 GPU/binder/ashmem 能用，这是必要的）。
+而 Android 宿主没有 `/dev/shm`。于是：
+
+- musl 的 `shm_open()` 实现就是 `open("/dev/shm/<name>")` → **ENOENT**
+- wlroots 的 headless 后端要建 shm framebuffer → 拿不到 → 每次 commit 都失败
+- dbus / PulseAudio / Chromium 同样依赖
+
+**更隐蔽的是**：在 rootfs 里 `mkdir /dev/shm` 没用 —— 因为 `/dev` 是透传的，
+rootfs 里那个目录根本不会被看到。必须先改路径翻译，再建目录。
+
+### 修法（两半，缺一不可）
+
+**① C 侧：把 `/dev/shm` 排除出透传**（`src/dsh_alpine.c`）
+
+```c
+static int is_shm_path(const char *p) {
+    static const char a[] = "/dev/shm";
+    const char *x = p; const char *y = a;
+    while (*y && *x == *y) { x++; y++; }
+    if (*y) return 0;
+    return (*x == 0 || *x == (char)47);
+}
+
+static int is_host_passthrough(const char *p) {
+    if (is_shm_path(p)) return 0;      /* ← 必须在 /dev/ 前缀之前 */
+    static const char *prefix[] = { "/proc/", "/proc", "/sys/", "/sys", "/dev/", "/dev" };
+    ...
+}
+```
+
+**② Kotlin 侧：部署 rootfs 时建 `<rootfs>/dev/shm`**（`LinuxEnvironmentManager.ensureShmDir`）
+
+```kotlin
+val shm = File(root, "dev/shm")
+if (!shm.isDirectory) shm.mkdirs()
+shm.setReadable(true, false); shm.setWritable(true, false); shm.setExecutable(true, false)
+```
+
+调用点在 `installLinuxCompatShims(root)` 之后 —— 必须在那之后，
+否则解包或 shim 步骤可能覆盖。
+
+### 验证
+
+```sh
+# 容器内：shm_open 成功 + 目录可写
+/bin/sh -c '/tmp/so; touch /dev/shm/z && echo WRITE_OK'
+
+# 决定性反证：把宿主 /dev/shm 删掉，容器内仍然可用
+adb shell "rm -f /dev/shm/*; rmdir /dev/shm"
+/bin/sh -c '/tmp/so'                    # → shm_open=9   （仍成功）
+```
+
+修复后截图真的出图了（`grim` 写出合法 PNG，`89 50 4e 47` 头），
+画面里能看到我们自己那个 wayland 客户端的橙蓝渐变方块被 compositor 合成。
+
+### 教训
+
+1. **「分配器创建成功 + 分配失败」这种组合，先怀疑设备节点/挂载点缺失，
+   而不是库的 bug。** 分配器创建只检查能力，真正分配要碰设备。
+2. **透传列表是一个不断被发现的过程**。每加一个透传前缀（`/proc`、`/sys`、`/dev`），
+   都要问：**宿主上这个东西真的存在且语义等价吗？** `/dev/shm` 就是反例 ——
+   Linux 桌面标配，Android 没有。
+3. **同一个路径要改两处**（C 侧翻译 + Kotlin 侧建目录），只改一处症状不变，
+   所以必须两边都有探针守着（`scripts/probes/_test_linux_shm.py`，A/B 两段）。

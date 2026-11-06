@@ -47,6 +47,23 @@ else
   echo "  SKIP inotifyd 不可用（rootfs 太简，不影响判据）"
 fi
 
+echo "=== 3a) AF_UNIX（guest 侧，musl 探针）==="
+# ★这才是「容器内 AF_UNIX 能不能用」的真判据。
+# bench/unix_socket_probe 是 bionic，经 cleaner 跑的是宿主路径（pitfalls #41），
+# 只能验 loader 的 sockaddr_un 重拼逻辑。guest 路径的真实行为必须用 musl 程序测。
+if [ -x "$F/unixsock_guest" ]; then
+  uo=$($R $M $F $I /bin/sh -c "mkdir -p /tmp/wl; /unixsock_guest /tmp /tmp/wl /dsh /eng /ws" 2>&1)
+  echo "$uo" | grep -q "RESULT: UNIXSOCK_GUEST_OK"     && echo "  OK  guest 路径 bind/connect/rw 全通"     || { echo "  FAIL guest AF_UNIX"; echo "$uo" | grep "FAIL" | head -3; fail=$((fail+1)); }
+else
+  echo "  SKIP rootfs 内没有 unixsock_guest（gcc -O2 -o unixsock_guest bench/unixsock_guest.c）"
+fi
+
+echo "=== 3c) POSIX 共享内存（/dev/shm，pitfalls #44）==="
+# Android 宿主没有 /dev/shm，而 /dev 整棵透传。这条不验，
+# 所有走 shm_open 的程序（wlroots/dbus/Chromium）都会静默失败。
+so=$($R $M $F $I /bin/sh -c 'ls -ld /dev/shm 2>&1; touch /dev/shm/.dshchk 2>/dev/null && echo SHM_WRITE_OK && rm -f /dev/shm/.dshchk || echo SHM_WRITE_FAIL' 2>&1)
+echo "$so" | grep -q SHM_WRITE_OK   && echo "  OK  /dev/shm 可写（容器自有，不依赖宿主）"   || { echo "  FAIL /dev/shm 不可用：$(echo "$so" | head -2)"; fail=$((fail+1)); }
+
 echo "=== 3b) AF_UNIX bind/connect（bionic 探针，仅验宿主侧）==="
 # 注意：unix_socket_probe 与 path_probe 同样是 bionic，测的是**宿主**路径空间。
 # 它的价值是验证 loader 的 sockaddr_un 重拼逻辑本身没错（不 EINVAL），
@@ -119,7 +136,8 @@ else
     weston --backend=headless-backend.so --renderer=gl --socket=wl-g1 --idle-time=0 > /tmp/wg.log 2>&1 &
     sleep 5; kill %1 2>/dev/null
     grep -oE "GL renderer: .*" /tmp/wg.log | head -1
-  ' 2>&1 | tr -d "")
+  ' 2>&1 | tr -d "
+")
   [ -n "$rend" ] && echo "  INFO $rend"
 fi
 

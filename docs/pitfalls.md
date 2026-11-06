@@ -837,3 +837,39 @@ Layer 4 (pos 0x80000000):
 `role xdg_toplevel` + `top-level window 'simple-shm'` = 一个真实的顶层窗口，
 250×250 居中（307,79 → 557,329），带 panel 与 background。**这是容器内
 GUI 应用开窗口可行性的直接证据**，且它依赖的就是本文档 #35 的 AF_UNIX 修复。
+
+## 37. 容器内装包完全依赖 App 进程的 DNS 代理 —— App 不在线就装不了任何东西
+
+**这不是 bug，是一条必须知道的架构约束**，但排查时极易误判成「网络坏了」。
+
+**现象**：手工用 `root`（或 `run-as`）在设备上直接跑容器：
+
+```sh
+env DSH_DNS_PORT=15353 <runner> <rootfs> /lib/ld-musl-x86_64.so.1     /sbin/apk add --no-progress weston
+# → rc=99
+# → ERROR: Failed to open apk database: temporary error (try again later)
+```
+
+**原因**：App uid 绑不上 53（特权端口），所以容器的 DNS 由 **App 进程内的
+`LinuxDnsProxy`** 在 127.0.0.1:15353 上代答，loader 负责双向端口改写。
+**App 进程不在，就没人监听 15353** —— 而 `DSH_DNS_PORT=15353` 仍照常传给
+loader，于是容器把查询发到一个死端口，表现和「镜像站挂了」一模一样。
+
+**判据**（一行确认）：
+
+```sh
+adb shell "cat /proc/net/tcp | awk '{print \$2}' | grep -ci 3BF9"
+# 0 = 代理没在跑（0x3BF9 = 15353）
+```
+
+**实际后果**：
+- 用 `root`/`run-as` 手工起容器做实验时，**必须先让 App 跑起来**，否则任何
+  联网操作（`apk update` / `apk add` / `wget`）都失败。
+- 反过来，如果用户能装上包，说明 App 一定是活的、代理一定起来了。
+- 若 App 被省电策略杀掉而后台引擎还在跑，也会落到这个状态（`DshApp` 的注释
+  里记了这条，所以代理预启动放在 `onCreate` 而不是 `readiness()`）。
+
+**已修的相邻问题**：`LinuxPackageManager` 现在会在 `refreshIndex()` /
+`install()` 执行前调一次 `ensureDnsProxy()`，避免「刚开 App、代理还在后台线程
+起、用户已点安装」的竞态。但这只是让代理"尽快起来"，不能改变「App 必须在」
+这个前提。

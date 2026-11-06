@@ -353,3 +353,36 @@ done frames=30 elapsed=1441ms fps=20.8
    想再快只有两条路：硬件合成（AHB/gralloc 零回读，需 libhybris）或降分辨率。
    在当前「免 root + 无 libhybris」的前提下，150 fps @ 1080p 已经是这条
    路线的上限。
+
+### 6.11 显示端（App 侧贴图）实测与瓶颈定位
+
+容器 → 共享文件这一段能跑 150 fps @1080p（6.10），但**贴到屏幕上**是另一段，
+必须单独量。App 侧 `LinuxFrameSurface` 每 2 秒打一行分段日志：
+
+```
+display fps=30.5 shown=133 lastSeq=13956 size=1280x720 pull=1.4ms draw=0.7ms
+```
+
+模拟器 dsh34 / x86_64 / SwiftShader / 720p：
+
+| 阶段 | lockCanvas（改前） | lockHardwareCanvas（改后） |
+| --- | --- | --- |
+| pull（mmap→Bitmap） | 1.4 ms | 1.3 ms |
+| draw（Canvas→Surface） | **12.7 ms** | **0.4~0.8 ms** |
+| 显示帧率 | 29~30 fps | 28~31 fps（同） |
+
+**结论一：软件 Canvas 是显示端的头号瓶颈。** `lockCanvas()` 拿的是软件
+Canvas，`drawBitmap` 走 CPU 逐像素合成，720p 一次 12.7 ms；换
+`lockHardwareCanvas()` 交给 GPU 合成后降到 0.4~0.8 ms，**20 倍**。
+
+**结论二：剩下的 ~30 fps 不是我们的代码。** 对照实验——把 `drawBitmap`
+整个去掉、只留 `drawColor(BLACK)`，帧率**仍是 30 fps**。所以那个上限来自
+模拟器的 vsync 调度（该 AVD 的 `renderFrameRate` 报 60，但实际只给到 30
+个回调），不是绘制开销。真机 60/120Hz 屏上这个上限会相应提高。
+
+**结论三：字节序错了会让脏帧检测完全失效。** `ByteBuffer` 默认
+`BIG_ENDIAN`，而容器（aarch64/x86_64 都是小端）按小端写 seq。不设
+`order(LITTLE_ENDIAN)` 时 `getInt(4)` 读出字节反转的垃圾值——实测打出
+`lastSeq=-1475936256`、`1057488896`、`-418906112` 这类乱数，于是**每帧都被
+判成新帧**，重复帧也要白拷一次整帧（1080p 是 8.3 MB）。修正后 lastSeq
+变成正常单调递增（6002 → 6719）。

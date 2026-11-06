@@ -158,3 +158,69 @@ dsh_alpine --dsh-reexec-v1 --rootfs $R --interp /lib/ld-musl-aarch64.so.1 \
 
 # 4. PRoot 侧同参数跑同一份二进制，交替 3~5 轮取中位
 ```
+
+---
+
+## 六、容器内硬件 GPU 通路（2026-11-06 实测）
+
+### 6.1 结论先行
+
+在**免 root** 的 musl 容器里，bionic 图形程序能用上**宿主 GPU**，并完成真实
+渲染（不只是枚举设备）：
+
+| 项 | 实测值 | 环境 |
+| --- | --- | --- |
+| GL_RENDERER | `Android Emulator OpenGL ES Translator (Google SwiftShader)` | 模拟器 dsh34 / x86_64 / API 34 |
+| EGL | 1.4 Android META-EGL，vendor=Android | 同上 |
+| GL_VERSION | OpenGL ES 3.0 (SwiftShader 4.0.0.1) | 同上 |
+| 1080p 清屏（含 glFinish） | **1.125 ms/帧** | 60 帧 + 10 帧预热 |
+| 拾取/回读正确性 | 中心像素 RGBA = `255,89,26,255`（对齐 `glClearColor(1.0,0.35,0.1)`） | 同上 |
+
+真机上对应的是 `Adreno (TM) 840`（历史实测，见 mechanism.md 的 cleaner 一节），
+模拟器上则是 SwANGLE/SwiftShader。**两者走的是同一条通路**，只换后端实现。
+
+### 6.2 为什么这条路能成立
+
+musl 装不了 bionic 的 `libc.so` / `linker64`（实测 `__register_atfork` 符号
+缺失），所以容器内**不能**直接 `dlopen libEGL.so`。唯一出路是「让一个不带
+seccomp filter 的进程去 exec bionic 程序」——也就是 cleaner 机制：
+
+1. `dsh_alpine` 在第一次 `install_filter()` **之前** fork 出 cleaner
+   （此刻进程干净，`PR_GET_SECCOMP=0`）；
+2. 容器内任何 `execve` 打到 bionic ELF（`PT_INTERP` 含 `linker64`）时，
+   handler 不翻译路径、不装载，改由 cleaner 代跑宿主真实路径；
+3. cleaner 是 bionic 环境，`dlopen("libEGL.so")` 直接成功。
+
+**必须经 `sh -c` 触发**：直接 `dsh_alpine ... /gpu_probe` 会先按 musl 装载，
+报 `__libc_init: symbol not found`；只有容器内再发起一次 `execve` 才命中直通分支。
+
+### 6.3 帧回传成本分解（决定「能不能开窗口」）
+
+免 root 时容器侧建不了 SurfaceFlinger layer（需要 app Binder 权限）。可行的
+窗口方案只能是「容器离屏渲染 → 回读 → 交给 App 的 SurfaceView 贴图」。实测
+这条链路里容器侧那一段：
+
+| 分辨率 | render+finish | glReadPixels | write | 合计 | 等效 fps |
+| --- | --- | --- | --- | --- | --- |
+| 1280×720 | 0.455 ms | 2.705 ms | 0.008 ms | **3.183 ms** | 314 |
+| 1920×1080 | 1.125 ms | 5.630 ms | 0.014 ms | **6.777 ms** | 148 |
+
+**`glReadPixels` 是唯一瓶颈**（占 83%），因为它强制同步等待 GPU 完成并回拷。
+即便如此，1080p 仍有 148 fps 的理论上限，是 60fps 门槛的 2.4 倍——说明
+「回读 + App 贴图」这条路在性能上可用，不需要自建 compositor 才能开窗口。
+
+真正的代价在 App 侧的每帧贴图与格式转换（未测），以及回读带来的输入延迟。
+
+### 6.4 与自建 compositor（TAWC 路线）的取舍
+
+tawcroot 走的是「Smithay compositor + libhybris fork」：容器内直接建 Wayland
+surface，硬件合成，零回读。代价是要维护 aarch64 TLS thunk patcher、bionic
+TLS/IE-TLSDESC 兼容、AHB gralloc backend、Wayland EGL 平台适配（含
+`NATIVE_WINDOW_BUFFER_AGE=0`）等几十个补丁。
+
+本方案用「回读 + App 贴图」绕过全部这些：不需要 AHB、不需要 gralloc、
+不需要 TLS thunk（因为根本不在 musl 里加载 bionic 的 GL 库）。代价是
+6.8ms/帧的回读开销与一帧延迟。
+
+**两条路的性能差距在 1080p 下不足以否定后者**（148 fps vs 屏幕 60/120Hz）。
+对「手机里有个能跑图形程序的 Linux」这个产品形态，回读方案是更短的路径。

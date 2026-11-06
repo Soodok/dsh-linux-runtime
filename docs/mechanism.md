@@ -177,6 +177,54 @@ musl **装不了 bionic 库**（`dlopen` 报 `__register_atfork: symbol not foun
 关键点：cleaner 必须在**第一次 `install_filter()` 之前** fork ——
 filter 装上不可移除，fork 必然继承。
 
+### 7.1 触发条件与一个容易踩的坑
+
+只有满足两个条件才走这条桥：
+
+1. 目标 ELF 的 `PT_INTERP` 含 `linker`（`guest_is_bionic()` 读程序头判断）；
+2. 该 `execve` 是从**容器内**发起的。
+
+**直调不生效**：`dsh_alpine <rootfs> <interp> /gpu_probe` 会把 `/gpu_probe`
+当 guest 交给 musl interp 装载，报
+
+```
+Error relocating /gpu_probe: __libc_init: symbol not found
+Error relocating /gpu_probe: __register_atfork: symbol not found
+```
+
+因为这条路径上没有经过 handler 的 `execve` 分支。必须**再套一层 shell**：
+
+```sh
+dsh_alpine <rootfs> <interp> /bin/sh -c "/gpu_probe"
+```
+
+`sh` 在容器内发起 `execve("/gpu_probe")`，才命中 `guest_is_bionic()` → cleaner。
+
+### 7.2 已验证的 GPU 能力
+
+模拟器（x86_64 / API 34 / SwiftShader 后端）实测：
+
+```
+EGL 1.4 vendor=Android
+GL_RENDERER=Android Emulator OpenGL ES Translator (Google SwiftShader)
+GL_VERSION=OpenGL ES 3.0 (SwiftShader 4.0.0.1)
+中心像素 RGBA = 255,89,26,255   ← glClearColor(1.0,0.35,0.1) 回读，证明真渲染
+```
+
+真机（Adreno 840）历史实测同样拿到 `Adreno (TM) 840`。两者是同一条通路，
+只换 GL 后端。探针与性能数据见 `docs/benchmark.md` 第六节。
+
+### 7.3 写 bionic 探针的两个坑
+
+1. **不能静态链接 libEGL**。直接 `-lEGL` 链接会在 bionic 的非 zygote 进程里
+   触发 `FORTIFY: pthread_mutex_lock called on a destroyed mutex` 直接 abort。
+   必须 `dlopen("libEGL.so")` + `dlsym`。
+2. **`printf` 同样会崩**。stdio 内部也走 mutex，所以输出要用裸 `write(1, ...)`
+   （或用 `vsnprintf` 组缓冲后 `write`）。
+
+这两条不是本方案的缺陷，而是「bionic 图形栈假设自己跑在 zygote 子进程里」的
+固有前提；cleaner 进程不满足该前提。
+
 ## 参考
 
 - seccomp: `man 2 seccomp`，内核 `Documentation/userspace-api/seccomp_filter.rst`

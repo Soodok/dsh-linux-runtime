@@ -411,3 +411,56 @@ stat("/etc", {st_mode=001, st_size=0, ...}) = 4
 **诊断提示**：这类问题**不会**在 strace 里留下任何被拦记录（因为压根没有
 syscall）。看到「链接建成功、读不到」且 strace 里 `cat` 的 openat 参数是
 那个链接名本身，就该想到内核自己展开了。
+
+## 31. 宿主进程自带 seccomp filter 时，容器整体跑不起来（模拟器上才暴露）
+
+**症状**：从 App 进程 `ProcessBuilder` 拉起的容器，任何命令都立刻死，
+`rc=139`（SIGSEGV）或 `rc=159`（SIGSYS），**stdout/stderr 全空**、耗时只有
+100~200ms（而正常运行 `apk update` 要 1~2 秒）。但同一条命令在 `adb shell`
+里、`run-as app.dsh.mobile` 里、手工 `env -i` 里**全部 rc=0 成功**。
+极易误判成「文件权限 / SELinux / 环境变量 / APK 里 runner 是旧版」。
+
+**根因**：Android 的 zygote 在 fork 出 App 进程**之后**、跑 App 代码之前，
+会由 libseccomp 装上 app policy filter。实测：
+
+| 进程 | `Seccomp:` | `Seccomp_filters:` |
+|---|---|---|
+| `zygote64` 本体 | 0 | 0 |
+| App 进程（zygote fork 出来的） | **2** | **1** |
+| `adb shell` / `run-as` 起的进程 | 0 | 0 |
+
+seccomp 是**栈式叠加**的：同一 syscall 必须所有 filter 都返回 ALLOW 才放行，
+否则取最严格的 action（`KILL` > `TRAP` > `ERRNO` > `ALLOW`）。于是外层
+zygote 的 `KILL` 会先于我们自己的 `TRAP` 生效 —— 我们的 SIGSYS handler
+根本没机会被调用，进程直接被内核杀掉。
+
+而加载器的 `PR_GET_SECCOMP` 判据是「为 2 就认为自己的 filter 已装好」（这是
+为了跨 `execveat` 自我重执行时不重复叠加），在外层已有 filter 的场景下
+**判断错位**：既没装自己的 filter（被跳过），又继承了外层的 KILL 策略。
+
+**为什么真机不复现**：真机（OPPO ColorOS / 一加）的 app seccomp policy 或
+内核配置允许了我们需要的 syscall 集合，进程能活。这是**设备/ROM 相关**的
+差异，不是代码缺陷。
+
+**诊断手法（本次靠它定位）**：
+1. 在调用点跑两个探针，把「容器整体起不来」和「只有某个程序崩」区分开：
+   - `runner.run("")`（不跑 guest）→ 拿到 `rc=5` + `LOADER: preload FAIL`
+     说明 **loader 本体能 exec、能打印**，崩溃在装载 guest 之后；
+   - `runner.run("/bin/sh", ["-c","echo X"])` → `rc=139`。
+2. 用 `DSH_ALPINE_NO_FILTER=1` 跳过 `install_filter()` 再做一次对照：
+   - 跳过自己的 filter → `rc=159`（SIGSYS，说明外层 filter 在杀）；
+   - 装自己的 filter → `rc=139`（说明自己的 handler 内部又炸）。
+   两种都失败，就证明**不是我们的 filter 逻辑问题，而是外层 filter 在拦**。
+3. 对比 `grep -E "^Seccomp" /proc/<pid>/status`：App 进程 vs `run-as` 进程。
+
+**可行的绕过方向**（未实现，留作后续）：
+- App 侧把容器启动放到一个 `Seccomp: 0` 的子进程里 —— 但 zygote fork 的
+  子进程必然继承 filter，只能靠 `fork` 后 `exec` 一个**不受 app policy
+  约束**的中间程序（受 SELinux `execute_no_trans` 限制，未验证可行性）。
+- 扩充我们自己的 BPF 白名单，让所有被外层 policy 覆盖到的 syscall 也能通过
+  —— 但外层是 `KILL`，我们的 `ALLOW` 压不过它，此路不通。
+- 真机交付不受影响；模拟器上验证容器行为只能走 `run-as`（`Seccomp: 0`）。
+
+**结论**：在模拟器上做容器功能验证时，必须用 `run-as app.dsh.mobile <runner>
+<rootfs> <interp> <guest> ...` 而不是走 App UI —— 后者会因为 zygote filter
+而必然失败。这与容器实现本身无关。

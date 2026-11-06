@@ -532,3 +532,83 @@ weston-debug scene-graph
 **注意**：产品不需要 compositor 抓帧。容器内 GL 程序的画面走
 `lib/dsh_gl` 的共享文件 + App 侧 `LinuxFrameSurface` mmap，那条路径与
 compositor 无关，已单独验证过（第 7 节）。
+
+## 10. 可复现的独立验证环境（不依赖 App）
+
+前面的实测都在 App 内（debug 包 + `LinuxEnvironmentManager` 部署）跑。App 被
+换包/被杀后无法重放。这一节给出**完全不依赖 App 的复现步骤**：用 `adb root`
+在 `/data/local/tmp` 建一套等价环境，跑同样的探针。
+
+```sh
+T=/data/local/tmp/dshtest
+adb root
+adb shell "rm -rf $T; mkdir -p $T/rootfs $T/home/w $T/eng $T/dsh"
+adb push app/src/main/jniLibs/x86_64/libdsh_alpine.so $T/dsh_alpine
+adb push app/src/main/assets/linux/rootfs-bootstrap-x86_64.tgz $T/rt.tgz
+adb shell "cd $T/rootfs && tar xzf ../rt.tgz && chmod 755 ../dsh_alpine"
+
+# ★ 必须把绝对软链改成相对，且只碰 symlink（见 pitfalls #38）
+adb shell "cd $T/rootfs && for d in bin sbin usr/bin usr/sbin; do
+  [ -d \"\$d\" ] || continue
+  for f in \"\$d\"/*; do
+    [ -L \"\$f\" ] || continue
+    t=\$(readlink \"\$f\")
+    case \"\$t\" in
+      /bin/busybox|*/bin/busybox)
+        case \$d in
+          usr/bin|usr/sbin) ln -sf ../../bin/busybox \"\$f\" ;;
+          sbin)             ln -sf ../bin/busybox \"\$f\" ;;
+          *)                ln -sf busybox \"\$f\" ;;
+        esac ;;
+    esac
+  done
+done"
+
+# root 域可直接用真实外部 DNS（见 pitfalls #39）
+adb shell "echo 'nameserver 223.5.5.5' > $T/rootfs/etc/resolv.conf"
+```
+
+跑探针（**必须带 `-m` 挂载，否则 `/dsh` `/eng` `/ws` 不存在，探针会假失败**）：
+
+```sh
+adb shell "$T/dsh_alpine -m /dsh:$T/dsh -m /eng:$T/eng -m /ws:$T/home/w     $T/rootfs /lib/ld-musl-x86_64.so.1 /bin/sh -c '/path_probe'"
+```
+
+实测输出（2026-11-06，模拟器 dsh34 / x86_64）：
+
+```
+--- realpath ---
+realpath(/) = /        realpath(/tmp) = /tmp     realpath(/dsh) = /dsh
+realpath(/eng) = /eng  realpath(/ws) = /ws
+--- inotify ---
+inotify_add_watch(/) = OK (wd=1)     inotify_add_watch(/tmp) = OK (wd=1)
+inotify_add_watch(/dsh) = OK (wd=1)  inotify_add_watch(/eng) = OK (wd=1)
+inotify_add_watch(/ws) = OK (wd=1)
+--- getcwd ---
+chdir(/) -> getcwd = /          chdir(/tmp) -> getcwd = /tmp
+chdir(/dsh) -> getcwd = /dsh    chdir(/eng) -> getcwd = /eng
+chdir(/ws) -> getcwd = /ws
+
+RESULT: PATH_PROBE_OK (fails=0)
+```
+
+```
+$ /unix_socket_probe /tmp /dsh /eng /ws /tmp/wl
+/tmp                     bind+connect+rw OK
+/dsh                     bind+connect+rw OK
+/eng                     bind+connect+rw OK
+/ws                      bind+connect+rw OK
+/tmp/wl                  bind+connect+rw OK
+
+RESULT: UNIX_SOCKET_OK (fails=0)
+```
+
+**意义**：这两条结论（路径语义修复、AF_UNIX 修复）从「App 内一次性实测」
+升级为「可在独立环境重放的复现」，不再依赖 App 是否被并发会话换包。
+
+### 这个环境装不了大包（如实记录）
+
+`apk add weston`（110 包 / 458 MiB）与 `apk add nodejs`（14 包，含
+`icu-data-full`）在模拟器上 **>15 分钟**仍未完成，最后进程被
+`ActivityManager` 杀（`Killing ... adj 0`，不是 phantom killer，见 pitfalls #38）。
+所以这个独立环境只适合跑**已编译好的小探针**，不适合装 GUI 栈或 node。

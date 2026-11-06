@@ -175,8 +175,23 @@ static int ldr_sigaction_sigsys(void (*h)(int, void *, void *)) {
     char sa[256];
     ldr_memset(sa, 0, sizeof(sa));
     *(unsigned long *)(sa + 0)  = (unsigned long)h;
-    // SA_SIGINFO(4) | SA_ONSTACK(0x08000000) | SA_NODEFER(0x40000000)
-    *(unsigned long *)(sa + 8)  = 4UL | 0x08000000UL | 0x40000000UL;
+    // ★不设 SA_ONSTACK（v1.6.16）。
+    //
+    //   sigaltstack 是**线程局部**的，而本 loader 只在主线程调过一次
+    //   sigaltstack()。带上 SA_ONSTACK 后，clone 出来的工作线程没有自己的
+    //   altstack —— 内核会退化到用该线程的普通栈，但更糟的是**所有线程共用
+    //   同一份全局 sigstk 缓冲**：两个线程同时触发 SIGSYS 时，两套 handler
+    //   栈帧落在同一块内存上互相覆盖，直接 SIGSEGV。
+    //
+    //   实测（Alpine gcc 编的 ripgrep，容器内跑 --json）：
+    //     · 真 chroot：多线程 30/30 全过
+    //     · 本 loader（带 SA_ONSTACK）：多线程 30 次挂 19 次
+    //     · 本 loader（去掉 SA_ONSTACK）：见下方探针断言
+    //   单线程 100% 正常，多线程才挂 —— 典型的共用 altstack 竞态。
+    //
+    //   handler 自身最深的栈帧只有 PATH_MAX(4KB) 级别，而 musl 线程默认栈
+    //   是 MB 级，直接用线程自己的栈完全够用，不需要 altstack。
+    *(unsigned long *)(sa + 8)  = 4UL | 0x40000000UL;
     *(unsigned long *)(sa + 16) = 0;
     return (int)raw6(134 /*SYS_rt_sigaction*/, 31 /*SIGSYS*/, (long)sa, 0, 8, 0, 0);
 }
@@ -934,6 +949,36 @@ static void make_host(char *buf, const char *path) {
     *d = 0;
 }
 
+// ★统一的「打开 guest 文件」入口（v1.6.16）。
+//
+// 背景：本文件里有十几处 `openat(g_rootfs_fd, "./<guest 路径>")` —— 全都只查
+// rootfs，不看 bind 表。于是任何落在 bind 挂载点下的 guest 路径（`/eng/...`、
+// `/ws/...`、`/dsh/...`、宿主 /storage 与 /data/user）在这些地方都会 ENOENT，
+// 而同样的路径经 syscall handler 的 openat 分支却正常（那里先调 bind_map）。
+//
+// 症状极具误导：`ls -l` 能看到文件、`stat` 能拿到 mode/size、`md5sum` 与
+// rootfs 内副本一致，只有 **exec 报 No such file or directory**；把同一文件
+// cp 到 /tmp 或 /bin 立刻能跑。
+//
+// 参数：
+//   path — guest 绝对路径（以 / 开头）
+//   flags — 传给 openat 的标志位
+// 返回：fd（>=0）或负 errno；bind 命中时相对 AT_FDCWD 打开宿主路径，
+//       否则相对 g_rootfs_fd 打开 "./<path>"。
+static long guest_open(const char *path, long flags) {
+    if (!path || path[0] != (char)47) return -2;   // 只接受绝对路径
+    // ★只用一个 PATH_MAX 缓冲（v1.6.16）。
+    //   本函数在 SIGSYS handler 内被调用（map_file / guest_is_bionic / loader_probe
+    //   都在 handler 路径上），而 handler 跑在 64KB altstack 上。开两个缓冲会多占
+    //   4KB，实测把 rg 的并发崩溃率从 3/15 放大到 10/15 —— 栈越界后表现为无信息的
+    //   SIGSEGV，极难归因。bind_map 只在命中时写 out，不命中时缓冲未被触碰，
+    //   所以复用同一个缓冲是安全的。
+    char buf[PATH_MAX];
+    if (bind_map(path, buf)) return raw6(SYS_openat, -100 /*AT_FDCWD*/, (long)buf, flags, 0, 0, 0);
+    make_rel(buf, path);
+    return raw6(SYS_openat, g_rootfs_fd, (long)buf, flags, 0, 0, 0);
+}
+
 // /dev 节点不能从 rootfs 里找（非 root 无权 mknod），必须透传到宿主真实节点。
 // 只放行安全的字符设备，避免 guest 触到宿主敏感设备。
 // v7：伪文件系统透传。
@@ -978,7 +1023,7 @@ static int dev_passthrough(const char *p) { return is_host_passthrough(p); }
 //   （musl 侧 llvmpipe 软渲染 30.5 ms/帧，bionic 侧 Adreno 840 只要 1.76 ms/帧，17.4 倍）。
 static int guest_is_bionic(const char *gpath) {
     char rel[PATH_MAX]; make_rel(rel, gpath);
-    long fd = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+    long fd = guest_open(gpath, 0);
     if (fd < 0) return 0;
     unsigned char hdr[64];
     long n = raw6(SYS_read, fd, (long)hdr, 64, 0, 0, 0);
@@ -995,7 +1040,7 @@ static int guest_is_bionic(const char *gpath) {
     for (int i = 0; i < phnum && i < 16; i++) {
         unsigned long off = (unsigned long)phoff + (unsigned long)i * phentsize;
         unsigned char ph[56];
-        long f2 = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+        long f2 = guest_open(gpath, 0);
         if (f2 < 0) return 0;
         raw6(SYS_lseek, f2, (long)off, 0, 0, 0, 0);
         long m = raw6(SYS_read, f2, (long)ph, 56, 0, 0, 0);
@@ -1007,7 +1052,7 @@ static int guest_is_bionic(const char *gpath) {
         unsigned long p_filesz = *(unsigned long *)(ph + 32);
         if (p_filesz == 0 || p_filesz > 256) return 0;
         char interp[260];
-        long f3 = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+        long f3 = guest_open(gpath, 0);
         if (f3 < 0) return 0;
         raw6(SYS_lseek, f3, (long)p_offset, 0, 0, 0, 0);
         long k = raw6(SYS_read, f3, (long)interp, (long)(p_filesz < 255 ? p_filesz : 255), 0, 0, 0);
@@ -1087,7 +1132,9 @@ static void sigsys(int s, siginfo_t *info, void *uc) {
         //   musl/llvmpipe 软渲染 30.54 ms/帧 vs bionic/Adreno 840 的 1.76 ms/帧（17.4×）。
         if (gpath && gpath[0] == (char)47 && guest_is_bionic(gpath)) {
             char hp[PATH_MAX];
-            make_host(hp, gpath);
+            // ★bind 下的 bionic 二进制也要查 bind 表（v1.6.16）：make_host 只拼
+            //   rootfs 前缀，会把 `/eng/...` 拼成 `$rootfs/eng/...`（不存在）。
+            if (!bind_map(gpath, hp)) make_host(hp, gpath);
             // 不能在本进程 exec：本进程带 filter，bionic 的 linker64 不会重装
             // SIGSYS handler，第一个被 TRAP 的 syscall 会直接杀掉它。
             // 交给 filter-free 的 cleaner 代跑，拿回退出码后本进程以同码退出。
@@ -1333,6 +1380,46 @@ static void sigsys(int s, siginfo_t *info, void *uc) {
     //
     // 端口来自环境变量 DSH_DNS_PORT；没有它就完全不动，语义与之前一致。
     // 只改回环（外部 DNS 本就被 Android 拦，改了没用还会掩盖问题）。
+    // ★connect 也要改写（v1.6.14）：musl 的 resolver 不用 connect（所以早期只在
+    // sendto 上改就够了），但 **curl / libcurl 用的是 connect + send** ——
+    // 包发往 127.0.0.1:53，那里没人监听，表现为 curl 完全无法解析域名，
+    // 而 wget / apk / node 都正常（它们走 musl resolver）。
+    //
+    // 这里把目标端口改成代理端口。连上之后 socket 的对端就是代理，
+    // 后续 send 不需要再改写，回程 recv 也不需要（对端端口本就是代理端口，
+    // 但 curl 不校验来源端口，与 musl 的 __res_msend_rc 不同）。
+    case SYS_connect: {
+        int port = dns_proxy_port();
+        const unsigned char *q = (const unsigned char *)a1;
+        long salen = (long)a2;
+        if (port > 0 && q && salen >= 8) {
+            unsigned int fam = (unsigned int)q[0] | ((unsigned int)q[1] << 8);
+            int hit = 0, need = 0;
+            unsigned char tmp[32];
+            if (fam == 2 /*AF_INET*/ && salen >= 16) {
+                unsigned int p_ = ((unsigned int)q[2] << 8) | (unsigned int)q[3];
+                if (p_ == 53 && q[4] == 127 && q[5] == 0 && q[6] == 0 && q[7] == 1) {
+                    hit = 1; need = 16;
+                }
+            } else if (fam == 10 /*AF_INET6*/ && salen >= 28) {
+                unsigned int p_ = ((unsigned int)q[2] << 8) | (unsigned int)q[3];
+                int is_lo = 1;
+                for (int k = 0; k < 15; k++) if (q[8 + k] != 0) { is_lo = 0; break; }
+                if (!(is_lo && q[23] == 1)) is_lo = 0;
+                if (p_ == 53 && is_lo) { hit = 1; need = 28; }
+            }
+            if (hit) {
+                for (int i = 0; i < need; i++) tmp[i] = q[i];
+                tmp[2] = (unsigned char)((port >> 8) & 0xFF);
+                tmp[3] = (unsigned char)(port & 0xFF);
+                r[0] = raw6(SYS_connect, a0, (long)tmp, need, 0, 0, 0);
+                return;
+            }
+        }
+        r[0] = raw6(SYS_connect, a0, a1, a2, a3, a4, a5);
+        return;
+    }
+
     case SYS_sendto:
     case SYS_sendmsg: {
         const unsigned char *q = 0;
@@ -1662,7 +1749,15 @@ static void sigsys(int s, siginfo_t *info, void *uc) {
         return;
     }
     default:
-        r[0] = (unsigned long long)(-ENOSYS);
+        // ★绝不返回 -ENOSYS。BPF 树是按 NR 白名单精确匹配的，理论上不该有未知
+        //   nr 被 trap 到这里；但一旦出现（新增 trap 而 handler 忘了写 case、
+        //   guest 用了变体 syscall），返回 -ENOSYS 会让 guest 看到
+        //   "Errno 38 Function not implemented" —— 表现为某个功能整个不可用，
+        //   却查不到任何权限或路径问题（curl 曾因此完全无法联网）。
+        //
+        //   这里透明转发：既然我们不知道该怎么处理，就不要妨碍它。
+        //   代价是这类 syscall 不再受路径翻译保护，但比"功能直接报废"好得多。
+        r[0] = (unsigned long long)raw6(nr, a0, a1, a2, a3, a4, a5);
         return;
     }
 }
@@ -1758,140 +1853,144 @@ static void install_filter(void) {
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
         BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_KILL_PROCESS),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, instruction_pointer) + 4),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, LOADER_BASE_HI, 142, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, LOADER_BASE_HI, 146, 0),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_readlinkat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_readlinkat, 0, 68),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_newfstatat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_newfstatat, 0, 67),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 138, 137),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 142, 141),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_recvmsg, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_recvmsg, 0, 33),
-        BPF_STMT(BPF_JMP|BPF_JA, 135),
+        BPF_STMT(BPF_JMP|BPF_JA, 139),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_execveat, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_execveat, 0, 17),
-        BPF_STMT(BPF_JMP|BPF_JA, 132),
+        BPF_STMT(BPF_JMP|BPF_JA, 136),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_openat2, 3, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_openat2, 0, 8),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 128, 127),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 132, 131),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_faccessat2, 3, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_faccessat2, 0, 3),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 124, 123),
-        BPF_STMT(BPF_JMP|BPF_JA, 122),
-        BPF_STMT(BPF_JMP|BPF_JA, 121),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 128, 127),
+        BPF_STMT(BPF_JMP|BPF_JA, 126),
+        BPF_STMT(BPF_JMP|BPF_JA, 125),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_statx, 3, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_statx, 0, 3),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 118, 117),
-        BPF_STMT(BPF_JMP|BPF_JA, 116),
-        BPF_STMT(BPF_JMP|BPF_JA, 115),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 122, 121),
+        BPF_STMT(BPF_JMP|BPF_JA, 120),
+        BPF_STMT(BPF_JMP|BPF_JA, 119),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_execve, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_execve, 0, 6),
-        BPF_STMT(BPF_JMP|BPF_JA, 113),
+        BPF_STMT(BPF_JMP|BPF_JA, 117),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_renameat2, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_renameat2, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 110),
-        BPF_STMT(BPF_JMP|BPF_JA, 108),
-        BPF_STMT(BPF_JMP|BPF_JA, 107),
+        BPF_STMT(BPF_JMP|BPF_JA, 114),
+        BPF_STMT(BPF_JMP|BPF_JA, 112),
+        BPF_STMT(BPF_JMP|BPF_JA, 111),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_clone, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_clone, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 97),
-        BPF_STMT(BPF_JMP|BPF_JA, 103),
-        BPF_STMT(BPF_JMP|BPF_JA, 102),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_rt_sigprocmask, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_rt_sigprocmask, 0, 14),
-        BPF_STMT(BPF_JMP|BPF_JA, 100),
+        BPF_STMT(BPF_JMP|BPF_JA, 101),
+        BPF_STMT(BPF_JMP|BPF_JA, 107),
+        BPF_STMT(BPF_JMP|BPF_JA, 106),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_connect, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_connect, 0, 14),
+        BPF_STMT(BPF_JMP|BPF_JA, 104),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_recvfrom, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_recvfrom, 0, 6),
-        BPF_STMT(BPF_JMP|BPF_JA, 97),
+        BPF_STMT(BPF_JMP|BPF_JA, 101),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_sendmsg, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_sendmsg, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 94),
-        BPF_STMT(BPF_JMP|BPF_JA, 92),
-        BPF_STMT(BPF_JMP|BPF_JA, 91),
+        BPF_STMT(BPF_JMP|BPF_JA, 98),
+        BPF_STMT(BPF_JMP|BPF_JA, 96),
+        BPF_STMT(BPF_JMP|BPF_JA, 95),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_sendto, 2, 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_sendto, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 89),
-        BPF_STMT(BPF_JMP|BPF_JA, 87),
-        BPF_STMT(BPF_JMP|BPF_JA, 86),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_utimensat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_utimensat, 0, 7),
-        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 83, 82),
+        BPF_STMT(BPF_JMP|BPF_JA, 93),
+        BPF_STMT(BPF_JMP|BPF_JA, 91),
+        BPF_STMT(BPF_JMP|BPF_JA, 90),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_rt_sigaction, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_rt_sigaction, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 80),
-        BPF_STMT(BPF_JMP|BPF_JA, 78),
-        BPF_STMT(BPF_JMP|BPF_JA, 77),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_newfstatat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_newfstatat, 0, 3),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_rt_sigaction, 0, 6),
+        BPF_STMT(BPF_JMP|BPF_JA, 88),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_rt_sigprocmask, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_rt_sigprocmask, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 85),
+        BPF_STMT(BPF_JMP|BPF_JA, 83),
+        BPF_STMT(BPF_JMP|BPF_JA, 82),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_utimensat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_utimensat, 0, 3),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 74, 73),
-        BPF_STMT(BPF_JMP|BPF_JA, 72),
-        BPF_STMT(BPF_JMP|BPF_JA, 71),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_renameat, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_renameat, 0, 34),
-        BPF_STMT(BPF_JMP|BPF_JA, 69),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_chdir, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_chdir, 0, 17),
-        BPF_STMT(BPF_JMP|BPF_JA, 66),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fchownat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fchownat, 0, 8),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 79, 78),
+        BPF_STMT(BPF_JMP|BPF_JA, 77),
+        BPF_STMT(BPF_JMP|BPF_JA, 76),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_statfs, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_statfs, 0, 35),
+        BPF_STMT(BPF_JMP|BPF_JA, 74),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fchmodat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fchmodat, 0, 18),
+        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 70, 69),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_openat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_openat, 0, 8),
+        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 66, 65),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_readlinkat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_readlinkat, 0, 3),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
         BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 62, 61),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_openat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_openat, 0, 3),
+        BPF_STMT(BPF_JMP|BPF_JA, 60),
+        BPF_STMT(BPF_JMP|BPF_JA, 59),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fchownat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fchownat, 0, 3),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 58, 57),
-        BPF_STMT(BPF_JMP|BPF_JA, 56),
-        BPF_STMT(BPF_JMP|BPF_JA, 55),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fchmodat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fchmodat, 0, 3),
-        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 52, 51),
-        BPF_STMT(BPF_JMP|BPF_JA, 50),
-        BPF_STMT(BPF_JMP|BPF_JA, 49),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fstatfs, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fstatfs, 0, 7),
-        BPF_STMT(BPF_JMP|BPF_JA, 47),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 56, 55),
+        BPF_STMT(BPF_JMP|BPF_JA, 54),
+        BPF_STMT(BPF_JMP|BPF_JA, 53),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_faccessat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_faccessat, 0, 3),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_faccessat, 0, 7),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 43, 42),
-        BPF_STMT(BPF_JMP|BPF_JA, 41),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 50, 49),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_chdir, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_chdir, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 47),
+        BPF_STMT(BPF_JMP|BPF_JA, 45),
+        BPF_STMT(BPF_JMP|BPF_JA, 44),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_fstatfs, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_fstatfs, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 42),
         BPF_STMT(BPF_JMP|BPF_JA, 40),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_statfs, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_statfs, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 38),
-        BPF_STMT(BPF_JMP|BPF_JA, 36),
-        BPF_STMT(BPF_JMP|BPF_JA, 35),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_mkdirat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_mkdirat, 0, 16),
-        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 32, 31),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_symlinkat, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_symlinkat, 0, 6),
-        BPF_STMT(BPF_JMP|BPF_JA, 29),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_linkat, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_linkat, 0, 2),
-        BPF_STMT(BPF_JMP|BPF_JA, 26),
-        BPF_STMT(BPF_JMP|BPF_JA, 24),
-        BPF_STMT(BPF_JMP|BPF_JA, 23),
+        BPF_STMT(BPF_JMP|BPF_JA, 39),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_unlinkat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_unlinkat, 0, 3),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_unlinkat, 0, 15),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 20, 19),
-        BPF_STMT(BPF_JMP|BPF_JA, 18),
-        BPF_STMT(BPF_JMP|BPF_JA, 17),
-        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_getcwd, 2, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_getcwd, 0, 7),
-        BPF_STMT(BPF_JMP|BPF_JA, 15),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 36, 35),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_linkat, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_linkat, 0, 6),
+        BPF_STMT(BPF_JMP|BPF_JA, 33),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_renameat, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_renameat, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 30),
+        BPF_STMT(BPF_JMP|BPF_JA, 28),
+        BPF_STMT(BPF_JMP|BPF_JA, 27),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_symlinkat, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_symlinkat, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 25),
+        BPF_STMT(BPF_JMP|BPF_JA, 23),
+        BPF_STMT(BPF_JMP|BPF_JA, 22),
         BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_mknodat, 3, 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_mknodat, 0, 3),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_mknodat, 0, 8),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
-        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 11, 10),
-        BPF_STMT(BPF_JMP|BPF_JA, 9),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 19, 18),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_mkdirat, 3, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_mkdirat, 0, 3),
+        BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 0xFFFFFF9C, 15, 14),
+        BPF_STMT(BPF_JMP|BPF_JA, 13),
+        BPF_STMT(BPF_JMP|BPF_JA, 12),
+        BPF_JUMP(BPF_JMP|BPF_JGT|BPF_K, SYS_getcwd, 2, 0),
+        BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, SYS_getcwd, 0, 2),
+        BPF_STMT(BPF_JMP|BPF_JA, 10),
         BPF_STMT(BPF_JMP|BPF_JA, 8),
         BPF_STMT(BPF_JMP|BPF_JA, 7),
         BPF_STMT(BPF_LD|BPF_W|BPF_ABS, (unsigned)offsetof(struct seccomp_data, args) + 8),
@@ -1926,11 +2025,7 @@ static void install_filter(void) {
 // 相比 read_into（先 open+read 到缓冲、再逐段 memcpy 到目标基址），省掉一次完整拷贝。
 static unsigned char *map_file(const char *path, unsigned long *out_len) {
     if (!path || path[0] != (char)47) return 0;
-    char rel[PATH_MAX];
-    rel[0] = (char)46;
-    { const char *p = path; char *d = rel + 1; int lim = PATH_MAX - 2;
-      while (*p && lim-- > 0) *d++ = *p++; *d = 0; }
-    long fd = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+    long fd = guest_open(path, 0);
     if (fd < 0) return 0;
     unsigned char st[256];
     if (raw6(SYS_fstat, fd, (long)st, 0, 0, 0, 0) < 0) { raw6(SYS_close, fd, 0,0,0,0,0); return 0; }
@@ -1946,12 +2041,7 @@ static unsigned char *map_file(const char *path, unsigned long *out_len) {
 
 static int read_into(const char *path, unsigned char **bufp, unsigned long *capp,
                      unsigned long *out) {
-    if (!path || path[0] != '/') return -1;
-    char rel[PATH_MAX];
-    rel[0] = '.';
-    { const char *p = path; char *d = rel + 1; int lim = PATH_MAX - 2;
-      while (*p && lim-- > 0) *d++ = *p++; *d = 0; }
-    long fd = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+    long fd = guest_open(path, 0);
     if (fd < 0) return -1;
     unsigned char stbuf[256];
     if (raw6(SYS_fstat, fd, (long)stbuf, 0, 0, 0, 0) < 0) { raw6(SYS_close, fd, 0, 0, 0, 0, 0); return -1; }
@@ -2090,6 +2180,30 @@ static long resolve_guest_path(const char *gpath, char *out) {
         while (*rp && base_len < PATH_MAX - 2) full[base_len++] = *rp++;
         full[base_len] = 0;
     }
+    // ★bind 挂载点下的路径不参与 rootfs 符号链接解析（v1.6.16）。
+    //
+    //   resolve_in_rootfs 全程用 g_rootfs_fd 相对解析，从不看 bind 表 —— 于是
+    //   `-m /eng:<宿主 engine 目录>` 之后，guest 里的 `/eng/xxx` 被当成
+    //   `$rootfs/eng/xxx`（不存在），execve 直接 ENOENT。
+    //
+    //   这不是理论问题：引擎的 `@vscode/ripgrep` 按 `process.platform-arch` 解析
+    //   平台包，容器里 platform=linux，只能把静态 rg 放进 engine 目录下的
+    //   `@vscode/ripgrep-linux-arm64/bin/rg`，由引擎用**绝对路径 spawn** ——
+    //   走的就是 /eng/... 。实测：文件 stat 得 mode=755 size=4771240、md5 与
+    //   /bin/rg 完全一致，但 exec 报 `No such file or directory`；同一文件 cp 到
+    //   /tmp 或 /bin 立刻能跑。典型的「bind 路径没翻译」症状。
+    //
+    //   这里**只跳过解析、保留 guest 路径**（不返回宿主路径）：后续装载统一走
+    //   guest_open()，由它查 bind 表拿到宿主 fd。若这里返回宿主路径，下游
+    //   make_rel() 会把它当 guest 路径再拼一次，变成 "$rootfs/<宿主路径>"。
+    {
+        char hp[PATH_MAX];
+        if (bind_map(full, hp)) {
+            scopy_(out, full);
+            g_resolve_missing = 0;
+            return 0;
+        }
+    }
     long _r = resolve_in_rootfs(full, out);
     g_resolve_missing = (_r == -2);
     return _r;
@@ -2104,9 +2218,7 @@ static long loader_probe(const char *gpath) {
     //   否则重执行拿到空路径（实测表现为空转/重开失败）。
     scopy_(g_guest_path, resolved);
     // (1) 先按原路径直接开（普通 ELF / 脚本）
-    char rel[PATH_MAX];
-    make_rel(rel, resolved);
-    long fd = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0 /*O_RDONLY*/, 0, 0, 0);
+    long fd = guest_open(resolved, 0 /*O_RDONLY*/);
     if (fd >= 0) { raw6(SYS_close, fd, 0,0,0,0,0); return 0; }
     // (2) 脚本的 shebang 解释器可能存在但脚本本体路径不同 —— 这里只关心本体
     return -1;
@@ -2187,7 +2299,7 @@ long loader_preload(const char *gpath, char **gargv, char **genvp, int full) {
         resolve_guest_path(gpath, g_guest_path);
     }
     // ★shebang 支持：npm / pip 等是 #! 脚本不是 ELF，内核会自动改写 argv，我们必须复刻
-    { long fd = raw6(SYS_openat, g_rootfs_fd, (long)script_rel(g_guest_path), 0, 0, 0, 0);
+    { long fd = guest_open(g_guest_path, 0);
       if (fd >= 0) {
         char hdr[256]; long n = raw6(SYS_read, fd, (long)hdr, 255, 0, 0, 0);
         raw6(SYS_close, fd, 0, 0, 0, 0, 0);
@@ -2316,14 +2428,12 @@ load_images:
     // guest ELF 用 mmap 零拷贝映射；失败再退回 read_into（兼容极少数不能 mmap 的场景）
     // v8：打开 rootfs 内 interp / guest 的 fd，供子进程文件映射装载
     if (g_interp_fd < 0) {
-        char rel[PATH_MAX]; make_rel(rel, g_interp_path);
-        long f = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+        long f = guest_open(g_interp_path, 0);
         if (f >= 0) g_interp_fd = (int)f;
     }
     {
-        char rel[PATH_MAX]; make_rel(rel, g_guest_path);
         if (g_guest_fd >= 0) { raw6(SYS_close, g_guest_fd, 0,0,0,0,0); g_guest_fd = -1; }
-        long f = raw6(SYS_openat, g_rootfs_fd, (long)rel, 0, 0, 0, 0);
+        long f = guest_open(g_guest_path, 0);
         if (f >= 0) g_guest_fd = (int)f;
     }
 
@@ -2451,7 +2561,7 @@ void ldr_entry(long argc, char **argv, char **envp) {
 
     // ---- altstack（handler 内可能 unmap guest 旧栈）----
     {
-        static unsigned char sigstk[64 * 1024] __attribute__((aligned(16)));
+        static unsigned char sigstk[256 * 1024] __attribute__((aligned(16)));
         // struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; }  (aarch64 布局)
         struct { void *sp; int flags; unsigned long size; } ss;
         ss.sp = sigstk; ss.flags = 0; ss.size = sizeof(sigstk);

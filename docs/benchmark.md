@@ -297,3 +297,32 @@ DSH_FRAME pid=19271 w=640 h=360 fmt=rgba8888
 结论：**「容器里跑图形程序并把画面显示在 App 里」这条路已经通**，缺的只是
 App 侧的 SurfaceView 贴图代码；而「容器程序像原生 App 一样拥有自己的系统
 窗口、硬件合成」仍然需要 compositor + libhybris，那是另一条路线。
+
+### 6.9 tri 模式：证明 GL 管线是完整的，不只是能清屏
+
+`framesrv` 第六个参数传 `tri` 会走真正的几何渲染路径：
+
+```
+/framesrv 1280 720 0 16 <共享文件> tri
+```
+
+它做的事：编译顶点/片元着色器 → `glGenBuffers` + `glBufferData` 上传顶点
+→ 每帧 `glDrawArrays(GL_TRIANGLES)` 画一个绕 Z 轴旋转的三角形 → `glFinish`
+→ `glReadPixels` 写共享文件。
+
+实测输出（模拟器 x86_64 / 480x270）：
+
+```
+tri mode: prog=0x3 vbo=1
+done frames=30 elapsed=1441ms fps=20.8
+```
+
+回读的帧里三角形区域是纯黄 `(255,242,51)`，清屏区是深绿 —— 视觉确认
+着色器、顶点缓冲、draw call 全部生效。
+
+**★这一步必须做，不能只验 `glClear`**：清屏能出像素只证明 EGL 上下文
+与回读通路通了，完全不能证明「着色器能编译、VBO 能上传、draw call 能
+光栅化」。踩到的具体坑：`vbo` 初值 0 是 GL 的「默认缓冲」，对它
+`glBufferData` 是 `INVALID_OPERATION`（静默失败，不报错），顶点数据根本
+不会上传，表现就是「program 链接成功、帧里只有清屏色」。必须
+`glGenBuffers(1, &vbo)` 先拿到名字。

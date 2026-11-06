@@ -103,13 +103,25 @@ TAWC 是独立 App + `ando` 命令做桥接 `[官方]`。
 | bionic 直通 + cleaner 代跑 | 容器内 exec 一个 bionic 程序 → 交给无 filter 的 cleaner 执行 | [实测] GPU 桥就靠它 |
 | 老式 syscall 改写 | x86_64 保留 15 个无 dirfd 的 `open/stat/lstat/...`，全部改写成 `*at` | [实测] |
 | 两级探针诊断 | 先验骨架（最简 `_start`+raw6）再验业务，避免在复杂程序里瞎猜 | [实测] |
+| **AF_UNIX socket 路径翻译** | `bind`/`connect` 的 `sockaddr_un.sun_path` 也翻译；缺任一层则所有 AF_UNIX 服务（wayland/X11/dbus/pulseaudio）起不来 | [实测] `unix_socket_probe` 三目录全 OK；weston/VNC 之所以能起全靠它 |
+| **容器内跑 Wayland compositor** | weston 14.0.2 headless + pixman 在容器内运行，真实客户端建出 `xdg_toplevel` 顶层窗口 | [实测] `weston-debug scene-graph` 有 `top-level window 'simple-shm'` 250×250 居中 |
+| **realpath / inotify 路径语义** | musl `realpath()` 走 `readlink("/proc/self/fd/N")`，`/proc` 透传宿主导致全失败；`inotify_add_watch` 无 `*at` 变体 | [实测] 缺任一条 → dsh 引擎 `startup failed`、7 个服务 missing |
 
 ## 三、我们明确不如 TAWC 的地方
 
 诚实列清楚，不然对比表没有可信度：
 
-1. **图形栈**：TAWC 有 Smithay compositor + libhybris fork，能开系统窗口、硬件合成、
-   XWayland。我们只有 EGL pbuffer + glReadPixels 回读。差距是数量级的工程量。
+1. **图形栈（差距已缩小，但仍存在）**：
+   - **已有**：容器内 EGL/GLES 硬件渲染 + 画面回传 App（`lib/dsh_gl` + `LinuxFrameSurface`）；
+     容器内 **weston headless compositor 能跑**，真实 Wayland 客户端能建出
+     `xdg_toplevel` 顶层窗口（`[实测]` scene-graph 有 `top-level window 'simple-shm'`）。
+   - **仍缺**：① **硬件合成** —— headless 后端走 `pixman`（CPU），没有 EGL/GBM 路径，
+     真机 GPU 并未参与 compositor 合成；② **系统窗口（SurfaceFlinger layer）** ——
+     需要 app Binder，免 root 拿不到；③ **从 compositor 抓帧** —— weston 14 的
+     `weston_capture_v1` 只授权它自己的 RDP 客户端，`grim` 要的
+     `wlr-screencopy` weston 不提供；④ **XWayland** —— `link()` 被 SELinux 拒，
+     无 root 时 X11 路线不通（这也是我们选 wayland 而非 X11 的实际原因）。
+   TAWC 用 Smithay + libhybris fork 解决了 ②③④。**差距在最难的两块上**。
 2. **发行版生态**：TAWC 用 Arch/Debian（glibc），能直接跑大量预编译程序。
    Alpine 是 musl，很多二进制要重编。
 3. **输入法/桌面集成**：TAWC 有 Android 键盘桥接、任务管理器、桌面快捷方式。
@@ -123,10 +135,21 @@ TAWC 是独立 App + `ando` 命令做桥接 `[官方]`。
   必须真机走 UI 路径验证。
 - **真机 Adreno 840 的帧率** —— 未测。上表全部数字来自模拟器 SwiftShader。
 - **冷启动 1.9s → 1.0s** —— 未达成。Tier0 已省 140ms，Node 24 / 堆参数 /
-  依赖缓存三条路实测否决。
+  依赖缓存三条路实测否决。**容器内引擎首测 5145ms 但原生基线未取到**
+  （`TMPDIR` 权限问题），这个数字不能与 1.9s 直接比。
+- **容器内 GUI 窗口的画面能否进 App** —— 未验证。compositor 能开窗口（scene-graph
+  有 `xdg_toplevel`），但 weston 14 的 capture 授权挡住抓帧。产品路径走的是
+  `lib/dsh_gl` 共享文件（与 compositor 无关），那条已单独验证。
+- **容器内装大包（weston/nodejs）的可行性** —— 模拟器上极慢且会被
+  ActivityManager 杀掉（`Killing ... app.dsh.mobile (adj 0): stop app.dsh.mobile`），
+  未能在干净环境完成端到端装包。这是模拟器 + 网络的限制，不是实现缺陷的定论。
 
 ## 五、一句话概括
 
 **同一条架构路线上的另一个实现。** 我们多出的是「免 root musl 的 DNS 改写」、
-「双架构」、「App 内嵌共享数据」这些小而实的点；TAWC 多出的是「真窗口 +
-硬件合成 + glibc 生态」这些大而硬的点。**没有壁垒，只有取舍。**
+「双架构」、「App 内嵌共享数据」、「AF_UNIX + compositor 能跑」这些点；
+TAWC 多出的是「系统窗口 + 硬件合成 + glibc 生态」这三块大而硬的点。
+
+**边界变化（本轮更新）**：图形栈的差距从「我们没有 compositor」缩小到
+「我们有 compositor 但不接硬件合成、也不进 SurfaceFlinger」。**壁垒没有建立，
+但第一道门槛已经跨过** —— 容器内能跑 GUI 程序这件事，从「不能」变成了「能」。

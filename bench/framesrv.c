@@ -27,13 +27,20 @@
  * 输出约定（首行，供宿主解析）：
  *   DSH_FRAME pid=<pid> w=<w> h=<h> fmt=rgba8888 path=<共享文件> renderer=<GL_RENDERER>
  *
- * 用法：/framesrv [w] [h] [frames] [间隔ms] [共享文件路径] [mode]
+ * 用法：/framesrv [w] [h] [frames] [间隔ms] [共享文件路径] [mode] [取像素方式]
  *   mode = clear（默认，纯色渐变清屏）| tri（清屏 + 旋转三角形）
  *   tri 模式用于证明 GL 管线是完整的（着色器编译、VBO、draw call 都走通），
  *   而不仅仅是 glClear 能出像素。
  *   frames=0 表示一直跑到被信号终止。
  *
+ *   取像素方式（第 7 个参数）：
+ *     rpix（默认）—— glReadPixels 逐行回读
+ *     ahb          —— 渲染进 AHardwareBuffer 再 lock（同进程 A/B 实测快 1.72 倍，
+ *                     见 benchmark 第 14 节；AHB 不可用时自动退回 rpix 并打印原因）
+ *     auto         —— 有 AHB 就用 AHB，没有就 rpix
+ *
  * 实测（模拟器 x86_64 / SwiftShader / 640x360 / 16ms 间隔）：稳定 32.8 fps。
+ * AHB 路径 1080p 端到端 6.344 ms/帧 vs glReadPixels 10.930 ms/帧（1.72 倍）。
  */
 #include <dlfcn.h>
 #include <unistd.h>
@@ -77,6 +84,20 @@ typedef int EGLint; typedef unsigned int EGLenum, EGLBoolean;
 #define HDR_BYTES 16u
 #define FRAME_MAGIC 0x4D415246u  /* 小端落盘后 od -c 读出即 "FRAM" */
 
+/* AHardwareBuffer 描述体（AOSP 定义，字段顺序不能改） */
+typedef struct {
+    unsigned int width, height, layers, format;
+    unsigned long long usage;
+    unsigned int stride, rfu0;
+    unsigned long long rfu1;
+} AHBDesc;
+
+#define AHB_FMT_RGBA8888        1
+#define AHB_USAGE_CPU_READ      (1ULL << 1)   /* CPU_READ_OFTEN */
+#define AHB_USAGE_CPU_WRITE     (1ULL << 3)   /* CPU_WRITE_OFTEN */
+#define AHB_USAGE_GPU_SAMPLED   (1ULL << 8)
+#define AHB_USAGE_GPU_COLOR_OUT (1ULL << 9)
+
 static void put_u32(unsigned char *p, unsigned v) {
     p[0]=(unsigned char)(v & 0xFF); p[1]=(unsigned char)((v>>8) & 0xFF);
     p[2]=(unsigned char)((v>>16) & 0xFF); p[3]=(unsigned char)((v>>24) & 0xFF);
@@ -99,6 +120,8 @@ int main(int argc, char **argv) {
     const char *sharepath = (argc > 5) ? argv[5]
                                        : "/data/data/app.dsh.mobile/files/dshframe.bin";
     int want_tri = (argc > 6 && strcmp(argv[6], "tri") == 0);
+    /* 第 7 个参数选取像素方式：rpix（默认）/ ahb / auto */
+    const char *pixmode = (argc > 7) ? argv[7] : "rpix";
     if (W < 16) W = 1280;
     if (H < 16) H = 720;
     /* 文件 = 16 字节头 + 整帧像素 */
@@ -217,6 +240,95 @@ int main(int argc, char **argv) {
 
     int i = 0;
     double t0 = now_ms();
+
+    /* ---- 可选取像素方式：AHB（渲染直写）vs glReadPixels ----
+     *
+     * 为什么要给这个选项：同进程 A/B 实测（benchmark 第 14 节）AHB 路径
+     * 1080p 端到端 6.344 ms/帧 vs glReadPixels 10.930 ms/帧，快 1.72 倍。
+     * 收益集中在「GPU→CPU 取像素」那一段（3.954 vs 8.379 ms，2.1 倍）。
+     *
+     * ★AHB 不可用时必须**安静地退回 rpix**，不能让帧服务整体失败：
+     *   真机上 AHardwareBuffer_createFromHandle 与 EGLImage 绑定的支持度
+     *   与模拟器不同（模拟器 gralloc allocator 未进 VINTF，见 pitfalls #41），
+     *   而帧服务是产线依赖的，退化成 rpix 只是慢一点，完全不能崩。
+     */
+    int use_ahb = 0;
+    void *ahb = 0;
+    AHBDesc ahbreal;
+    memset(&ahbreal, 0, sizeof ahbreal);
+    int (*ahb_lock)(void *, unsigned long long, int, const void *, void **) = 0;
+    int (*ahb_unlock)(void *, int) = 0;
+
+    if (strcmp(pixmode, "ahb") == 0 || strcmp(pixmode, "auto") == 0) {
+        void *nw = dlopen("libnativewindow.so", RTLD_NOW);
+        if (!nw) nw = dlopen("libandroid.so", RTLD_NOW);
+        int (*ahb_alloc)(const AHBDesc *, void **) =
+            nw ? dlsym(nw, "AHardwareBuffer_allocate") : 0;
+        void (*ahb_describe)(const void *, AHBDesc *) =
+            nw ? dlsym(nw, "AHardwareBuffer_describe") : 0;
+        void (*ahb_release)(void *) = nw ? dlsym(nw, "AHardwareBuffer_release") : 0;
+        ahb_lock = nw ? dlsym(nw, "AHardwareBuffer_lock") : 0;
+        ahb_unlock = nw ? dlsym(nw, "AHardwareBuffer_unlock") : 0;
+        void *(*getNCB)(const void *) =
+            dlsym(egl, "eglGetNativeClientBufferANDROID");
+        void *(*createImage)(void *, void *, unsigned, int *, const int *) =
+            dlsym(egl, "eglCreateImageKHR");
+        void (*glGenTex)(int, unsigned *) = dlsym(gl, "glGenTextures");
+        void (*glBindTex)(unsigned, unsigned) = dlsym(gl, "glBindTexture");
+        void (*glTexParam)(unsigned, unsigned, int) = dlsym(gl, "glTexParameteri");
+        void (*glImgTex)(unsigned, void *) = dlsym(gl, "glEGLImageTargetTexture2DOES");
+        void (*glGenFbo)(int, unsigned *) = dlsym(gl, "glGenFramebuffers");
+        void (*glBindFbo)(unsigned, unsigned) = dlsym(gl, "glBindFramebuffer");
+        void (*glFboTex)(unsigned, unsigned, unsigned, unsigned, int) =
+            dlsym(gl, "glFramebufferTexture2D");
+        unsigned (*glCheckFbo)(unsigned) = dlsym(gl, "glCheckFramebufferStatus");
+
+        const char *why = 0;
+        if (!ahb_alloc || !ahb_lock || !ahb_unlock) why = "no AHB symbols";
+        else if (!getNCB) why = "no eglGetNativeClientBufferANDROID";
+        else if (!createImage) why = "no eglCreateImageKHR";
+        else if (!glImgTex) why = "no glEGLImageTargetTexture2DOES";
+        else if (!glGenFbo || !glFboTex || !glCheckFbo) why = "no FBO symbols";
+
+        if (!why) {
+            AHBDesc want;
+            memset(&want, 0, sizeof want);
+            want.width = (unsigned)W; want.height = (unsigned)H; want.layers = 1;
+            want.format = AHB_FMT_RGBA8888;
+            want.usage = AHB_USAGE_GPU_SAMPLED | AHB_USAGE_GPU_COLOR_OUT |
+                         AHB_USAGE_CPU_READ | AHB_USAGE_CPU_WRITE;
+            if (ahb_alloc(&want, &ahb) != 0 || !ahb) why = "AHardwareBuffer_allocate failed";
+        }
+        if (!why) {
+            if (ahb_describe) ahb_describe(ahb, &ahbreal);
+            void *cbuf = getNCB(ahb);
+            int imgAttr[] = { 0x30D2 /*EGL_IMAGE_PRESERVED_KHR*/, 1, EGL_NONE, 0 };
+            void *img = cbuf ? createImage(d, EGL_NO_CONTEXT,
+                                           0x3140 /*EGL_NATIVE_BUFFER_ANDROID*/,
+                                           cbuf, imgAttr) : 0;
+            if (!img) why = "eglCreateImageKHR failed";
+            else {
+                unsigned tex = 0, fbo = 0;
+                glGenTex(1, &tex);
+                glBindTex(0x0DE1, tex);
+                glTexParam(0x0DE1, 0x2801, 0x2601);
+                glTexParam(0x0DE1, 0x2800, 0x2601);
+                glImgTex(0x0DE1, img);
+                glGenFbo(1, &fbo);
+                glBindFbo(0x8D40, fbo);
+                glFboTex(0x8D40, 0x8CE0, 0x0DE1, tex, 0);
+                if (glCheckFbo(0x8D40) != 0x8CD5) why = "FBO incomplete";
+                else use_ahb = 1;
+            }
+        }
+        if (use_ahb) {
+            P("pixmode=ahb stride=%u (AHB 直写，省 glReadPixels)\n", ahbreal.stride);
+        } else {
+            P("pixmode=rpix (fallback: %s)\n", why ? why : "unknown");
+        }
+        fsync(1);
+    }
+
     while (!g_stop && (frames <= 0 || i < frames)) {
         float t = (float)(i % 120) / 120.0f;
         cc2(t * 0.55f, (1.0f - t) * 0.55f, 0.32f, 1.0f);
@@ -230,7 +342,27 @@ int main(int argc, char **argv) {
             gdr(0x0004, 0, 3);
         }
         fi();
-        rp(0,0,W,H,0x1908,0x1401,pixels);
+        if (use_ahb) {
+            /* AHB 路径：GPU 已经直接写进 AHB，这里 lock 拿指针再拷进共享文件。
+             * AHB lock 内部也做 GPU→CPU 同步，但它比 glReadPixels 那套逐行拷
+             * 高效（实测 3.954 vs 8.379 ms @1080p），所以整体仍快 1.72 倍。
+             * stride 可能 > W*4（对齐），必须按行拷。 */
+            void *addr = 0;
+            if (ahb_lock(ahb, 0x2 /*CPU_READ_OFTEN*/, -1, (const void *)0, &addr) == 0 && addr) {
+                unsigned st = ahbreal.stride ? ahbreal.stride : (unsigned)(W * 4);
+                unsigned char *src = (unsigned char *)addr;
+                if (st == (unsigned)(W * 4)) {
+                    memcpy(pixels, src, pxsz);
+                } else {
+                    for (int y = 0; y < H; y++)
+                        memcpy(pixels + (size_t)y * (size_t)W * 4,
+                               src + (size_t)y * st, (size_t)W * 4);
+                }
+                ahb_unlock(ahb, 0);
+            }
+        } else {
+            rp(0,0,W,H,0x1908,0x1401,pixels);
+        }
         i++;
         /* 先更新尺寸/魔数再推 seq —— 宿主若在中间读到，seq 还是旧值，
            不会把半帧当成新帧显示。 */

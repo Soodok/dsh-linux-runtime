@@ -612,3 +612,58 @@ RESULT: UNIX_SOCKET_OK (fails=0)
 `icu-data-full`）在模拟器上 **>15 分钟**仍未完成，最后进程被
 `ActivityManager` 杀（`Killing ... adj 0`，不是 phantom killer，见 pitfalls #38）。
 所以这个独立环境只适合跑**已编译好的小探针**，不适合装 GUI 栈或 node。
+
+## 11. 容器层单进程开销 —— 冷启瓶颈到底在哪一层
+
+冷启优化的前提是先量清楚「容器这层自己花多少」。如果它很贵，那优化容器；
+如果它几乎免费，那所有努力都得放在 Node 引擎侧。
+
+### 测法（`/proc/uptime` 差值法，避免单次测量被 HZ 粒度吃掉）
+
+Android 内核 `HZ=100`，`/proc/uptime` 只有 10ms 粒度，单次测必然读到 0 或 10。
+必须**批 N 次取平均**：
+
+```sh
+S=$(cut -d' ' -f1 /proc/uptime)
+for i in $(seq 20); do
+  <runner> -m /dsh:$T/dsh <rootfs> /lib/ld-musl-x86_64.so.1 /bin/sh -c 'true' >/dev/null 2>&1
+done
+E=$(cut -d' ' -f1 /proc/uptime)
+awk "BEGIN{printf \"%.2f ms/run\", ($E-$S)*1000/20}"
+```
+
+### 实测（模拟器 dsh34 / Android 14 / x86_64，root 域）
+
+```
+20 runs: 4 ms/run
+```
+
+单次 `fork + execve + seccomp 装载 + SIGSYS 拦截 + busybox sh 启动 + 退出`
+**约 4ms**。
+
+单次 `date +%s%N` 包装的粗测（含两次 `date` 自身开销）：13 / 15 / 13 / 13 / 18 ms，
+差值就是 `date` 的开销 —— 这也是「用外部时钟包内层」的固有误差，
+所以上表用批平均法。
+
+### 对冷启目标的意义
+
+真机记录（同一台 OPPO PLZ110 / Android 16 / 内核 6.12.38，见 AI_CONTEXT 甲·五）
+的端到端「从零 → 进 Linux → DSH 就绪」**中位 1.33 秒**，其中
+**容器层仅占 0.8%（约 10ms），引擎插件加载占 96%**。本轮 4ms/进程 的独立测量
+与那个结论方向一致：
+
+> **容器层不是冷启瓶颈。** 把冷启从 1.9s 压到 1.0s 的空间几乎全在
+> Node 引擎的模块加载与插件激活上，容器侧再优化也只有个位数毫秒可捡。
+
+这也解释了为什么三条容器侧优化（Node 24、堆参数、依赖盘点缓存）实测都没有
+正向收益 —— 它们动的是引擎侧，而引擎侧的瓶颈是 `ModuleWrap` 与插件激活，
+不是容器拦截成本（实测 `(idle)` 只占 1.4%，`ModuleWrap` 占 13.8%）。
+
+### 已知的测量污染（都踩过）
+
+- **端口 TIME_WAIT**：连续测引擎启动必须每轮换端口 + `sleep 2`，否则
+  `EADDRINUSE` 直接失败（实测过三轮全废）。
+- **`pidof dsh_alpine` 杀不死**：重执行后进程名可能是 `dsh-alpine`，要两种都杀。
+- **`/proc/uptime` 只有 10ms 粒度**：单次测量全 0，必须批平均。
+- **toybox `date +%s%N` 不支持纳秒**：返回 0ms。
+- **App 不在前台会被 ActivityManager 杀**（adj 0）：见 pitfalls #38。

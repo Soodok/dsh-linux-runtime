@@ -1272,3 +1272,125 @@ $E/bin/node --build-snapshot --snapshot-blob $B/esm.blob $B/esm_snapshot_test.mj
 # 16.2 SEA
 $E/bin/node --experimental-sea-config $B/sea-config.json
 ```
+
+---
+
+## 第八节 · 冷启精确归因（无 App 的 root 域测量）
+
+### 为什么必须能脱离 App 测
+
+App 内跑引擎的环境由 Kotlin 注入，会话一多就被并发改包打断，测出来的数
+**不可复现**。root 域直跑只要 overlay 与 android-plugins 在就能测。
+
+前置两个坑（都不补会直接启动失败）：
+
+```sh
+# ① overlay 由 EngineConfig.ensureAndroidOverlay() 运行时生成，root 域没有
+adb push android-overlay.yml /data/local/tmp/ov.yml
+adb shell "cp /data/local/tmp/ov.yml $E/android-overlay.yml"
+
+# ② android-plugins 由 App 从 assets 解包，root 域也没有
+adb push app/src/main/assets/android-plugins /data/local/tmp/ap
+adb shell "cp -r /data/local/tmp/ap $E/android-plugins"
+```
+
+不补 ① 报 `failed to read overlay ... ENOENT`；不补 ② 会刷一屏
+`ERR_MODULE_NOT_FOUND: .../android-plugins/plugin-health.mjs`。
+
+工具全部在 `bench/coldstart/`：`run.sh` / `readyat.cjs` / `modcount.cjs`
+/ `rpcount.cjs` / `rpcache.cjs`。
+
+### 基线（模拟器 dsh34 / x86_64 / node v24.18.0 / dsh 0.2.2-rc.1）
+
+交替 3 轮，中位 **3213.5 ms**（3111.0 / 3213.5 / 3604.1）。
+**噪声底约 ±250ms** —— 任何小于此的优化都无法在这台设备上被证实。
+
+### 模块加载量（关键定量）
+
+```
+[modcount] resolves=488 unique=271 loads=662
+```
+
+**只有 271 个唯一模块**。所以「模块太多」不是原因，3.2 秒不是被文件数量堆出来的。
+
+### I/O 量
+
+```
+[iocount] stat=337 lstat=0 open=853 read=853 readdir=1 realpath=3490 io_ms=305.6
+```
+
+`realpath` 3490 次 vs 271 个模块 —— 重复 13 倍。逐个看：
+
+```
+[rp] calls=3490 unique=1554 ms=229.3 ms/call=0.066
+[rp-top] 108x .../@deepseek-ai/schemastery/lib/index.mjs
+[rp-top]  65x .../@deepseek-ai/cordis/lib/index.js
+[rp-top]  59x .../zod/v4/core/util.js
+[rp-top]  53x .../zod/index.js
+```
+
+同一路径最多被算 **108 次**，总耗时 229.3ms，看着有 150ms 可省。
+
+### ★实测无效的方向（不要再试）
+
+给 `realpathSync` 加进程内 Map 缓存（命中率 66.1%），交替 A/B 各 3 轮：
+
+| | 三轮 | 中位 |
+|---|---|---|
+| 基线 | 3111.0 / 3213.5 / 3604.1 | **3213.5 ms** |
+| 加缓存 | 3008.6 / 3443.1 / 3542.1 | **3443.1 ms** |
+
+**慢 229.6ms，两组范围完全重叠**。收益低于噪声底。
+
+推测（未验证）：0.066ms/次的 realpath 大部分是页缓存命中，真正开销被
+Map 查找 + wrapper 调用与 V8 内联失效抵消。
+
+### 对「1.0 秒」的硬判断（累计证据）
+
+| 方向 | 实测结论 |
+|---|---|
+| 容器层开销 | 4 ms/run（b147），不是瓶颈 |
+| 编译缓存 | 唯一已证收益，省 1112ms（24.5%） |
+| V8 快照 | ESM 不支持，双否 |
+| SEA 单文件 | `main` 只支持 CJS，ESM 收益归零 |
+| Node 24 | 慢 30~70% |
+| 堆参数 | 慢 18% |
+| realpath 缓存 | 慢 7%（本节） |
+
+**结论：调参数已无空间。1.0 秒需要换加载模型（把 ESM 模块图预编译成
+可 mmap 的字节码单元），不是继续微调。**
+
+### 6.13 冷启参数与缓存类优化：三条实测否证 + 理论下限
+
+模拟器 dsh34（Android 14 / x86_64 / API 34），node v24.18.0（bionic，
+`engine/bin/node`），引擎 `@deepseek-ai/dsh` 0.2.2-rc.1，DB 同为
+`files/engine/lib/node_modules`，每轮起前 `pkill -9 -f dsh/lib/bin.js` + `sleep 2`。
+口径统一：`--require readyat.cjs` 在拦到 `dsh web:` 那一刻打 `process.uptime()`。
+
+**阶段基线**（`--require` 探针实测，非推算）
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| `node -e 0`（空跑） | **186 ms** | 进程起 + V8 初始化 + 退出，批平均 |
+| `bin.js --version`（CLI 引导） | **444 ms** | 再加 commander 解析与模块解析入口 |
+| 完整就绪到 `dsh web:` | **3217.6 ms** | 5 轮中位（3024/3082/3218/3621/3860） |
+
+→ **插件加载段 = 3217.6 − 444 = 2773 ms（86%）**。容器层不在此路径上
+（独立实测 4 ms/run，见 §11），所以冷启的全部空间在 Node 侧的模块加载与插件启动。
+
+**三条否证（都不采用）**
+
+| 方向 | 做法 | 结果 | 结论 |
+|---|---|---|---|
+| realpath 结果缓存 | 拦 `fs.realpathSync` + `.native`，单参数形态走 Map | 命中率 **66.1%**（hits=1084/misses=555），但就绪中位 **3217.6 → 3443.1 ms（+7.1%）**，两组范围完全重叠 | 否证。`realpathSync` 确实被调 **3490 次**（唯一 1554，`schemastery/lib/index.mjs` 单文件 108 次、`cordis/lib/index.js` 65 次），总耗时 **229.3 ms**（0.066 ms/次）；但 Map 查找 + 包装函数的调用开销吃掉了收益 |
+| V8 并行编译线程 | `--v8-pool-size=4`（设备 4 核） | 5 轮中位 **3217.6 → 3149.2 ms（−2.1%）**，两组范围完全重叠 | 否证。噪声级 |
+| 模块加载量压缩 | 统计 `Module._resolveFilename` / `_load` | 启动共 **488 次 resolve、271 个唯一模块、662 次 load** | 否证「加载量太大」假设。271 个模块不算多，问题在每模块的成本（编译 + 磁盘 I/O），不在数量 |
+
+**理论下限推算**：`186 ms`（node 起）+ `258 ms`（CLI 引导净增）+ 插件框架与
+271 个模块的加载/编译。**即使把所有插件都禁用只剩框架，也要 ~1.0 秒以上**；
+1.0 秒整机冷启**需要更换加载模型**（把 ESM 模块图预编译成可 mmap 的字节码单元，
+或用 SEA 单文件 + 预编译字节码），不是调参数能到的。
+
+> 注：`fs` 包装必须 `Object.assign(wrapped, orig)` 保留静态属性，
+> 否则 `dsh-app-boot` 的 `realModuleDirectory` 调 `realpathSync.native` 报
+> `TypeError: realpathSync.native is not a function` 直接崩启动（实测踩过）。

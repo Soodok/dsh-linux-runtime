@@ -906,3 +906,188 @@ A 路径走 AHB、B 路径走普通 FBO + glReadPixels，各跑 60 帧。
 
 **结论**：容器内「GPU 零拷贝渲染」这半段完全打通且快了 20 倍；
 「交给 App 显示」那半段仍走原来的共享文件路径，尚未改用 AHB。
+
+## 15. 冷启 3.4 秒的第二次精确归因：模块加载基础设施合计约 1.8 秒
+
+### 为什么要重做
+
+第 13 节那份 profile 的 `(idle)` 只有 0.7%、node builtin 44.7%，看起来瓶颈清楚。
+但这次用**在就绪点主动截断**的探针（`bench/profat.cjs`）复测，发现分类漏了一大块：
+profile 里有一批样本的 `callFrame.url` 是空串，第 13 节把它们归进了「dsh 插件」或直接忽略，
+实际它们全是 node 的**模块加载 native 路径**。
+
+### 探针方法（这个坑必须记住）
+
+**不能用 `--cpu-prof`**：node 只在**正常退出**时才落盘。引擎就绪后是常驻服务、
+必须 `kill -9`，于是文件根本不生成：
+
+```
+$ node --cpu-prof ... bin.js web --no-open & ... kill -9 $P
+[readyat] 7180.6 ms rss=242MB
+ls: prof_full.cpuprofile: No such file or directory     <- 没写盘
+```
+
+**也不能用 `v8.startProfiling`**：那是 node 内部 `--prof` 路径的私有接口，
+公开的 `node:v8` 没有这个函数：
+
+```
+TypeError: v8.startProfiling is not a function
+```
+
+**正确途径是 inspector 协议**，并在拦截到 `dsh web:` 的那一刻 `Profiler.stop`：
+
+```js
+const session = new (require('node:inspector').Session)();
+session.connect();
+session.post('Profiler.enable', () => session.post('Profiler.start'));
+// 拦 console.log，命中 'dsh web:' 时：
+session.post('Profiler.stop', (err, res) => fs.writeFileSync(out, JSON.stringify(res.profile)));
+```
+
+这样 profile **天然截断在就绪点**，不会把就绪后的稳态空转算进来
+（第 13 节那次如果直接跑完再 kill，`(idle)` 会虚高到 68%）。
+
+### 实测构成（模拟器 dsh34 / x86_64 / node v24.18.0，uptime=3820ms）
+
+`total=3656.9ms samples=471`
+
+| 归谁 | 耗时 | 占比 |
+|---|---|---|
+| node builtin（`internal/*`、`node:*`） | **1213.1 ms** | **33.2%** |
+| **native/unknown（模块加载 native 路径）** | **605.8 ms** | **16.6%** |
+| `@deepseek-ai/cordis` | 496.7 ms | 13.6% |
+| GC | 260.3 ms | 7.1% |
+| `zod` | 98.8 ms | 2.7% |
+| `cordis-plugin-loader` | 76.1 ms | 2.1% |
+| `dsh-app-boot` | 73.0 ms | 2.0% |
+| `dsh-tools` | 70.7 ms | 1.9% |
+| `schemastery` | 64.4 ms | 1.8% |
+| `js-yaml` | 53.8 ms | 1.5% |
+| 其余（llm-deepseek / client-modules / domino / temporal / typert / commander 等） | 各 <50 ms | — |
+
+### `native/unknown` 那 606ms 到底是什么
+
+按自身耗时排序（`bench/profsum.mjs` 的明细模式）：
+
+```
+34.5 ms  ModuleWrap
+26.3 ms  openFileHandle
+22.1 ms  getPackageScopeConfig
+18.1 ms  lstat
+17.6 ms  internalModuleStat
+17.2 ms  evaluate
+17.1 ms  decodeUTF8
+15.6 ms  compileFunctionForCJSLoader
+15.1 ms  parse
+14.6 ms  readFileUtf8
+```
+
+**全是模块加载的基础设施**：stat 找包、读文件、UTF-8 解码、编译、包装成 ModuleWrap。
+
+### 结论修正
+
+第 13 节说「模块解析基础设施 约1.1 秒」，**实际是约 1.82 秒**
+（node builtin 1213 + native 模块加载 606），占总耗时 3.66 秒的 **50%**。
+
+这意味着：
+
+1. **`--no-warnings`、堆参数这类调参永远到不了 1.0 秒** —— 一半时间在文件系统
+   stat + 读文件 + 编译上。
+2. 唯一有效的方向是**减少要加载的文件数**或**避免重复编译**：
+   - 编译缓存已实测省 1112 ms / 24.5%（第 12 节），这是现在唯一已兑现的收益
+   - 进一步要动的是「打包成更少的文件」或「预编译成字节码」，不是调 node 参数
+3. **快照 / SEA 两条路已实测不可行**（见第 16 节）。
+
+### 复跑命令
+
+```sh
+# 在设备上
+export LD_LIBRARY_PATH=$B/engine/lib TMPDIR=$B/dsh-home/tmp
+export HOME=$B/dsh-home DSH_HOME=$B/dsh-home
+export NODE_COMPILE_CACHE=$B/dsh-home/.node-compile-cache
+$B/engine/bin/node --expose-internals --require $B/profat.cjs \
+  $B/engine/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web --no-open
+# 拉回 profile 后本地汇总
+node bench/profsum.mjs <file.cpuprofile>
+```
+
+## 16. 快照与 SEA 实测：两条「换加载模型」的路都走不通
+
+第 13/15 节都指向同一个结论：要碰到 1.0 秒必须换加载模型。候选只有两个：
+Node 的 **startup snapshot** 与 **SEA（Single Executable Application）**。
+两条都实测过了，都不可行。
+
+### 16.1 startup snapshot：ESM 入口直接不支持
+
+**好消息**：快照对纯 CJS 脚本收益巨大。同一台设备、同一份脚本：
+
+| 方式 | 三轮 uptime | 中位 |
+|---|---|---|
+| 普通启动 | 153 / 163 / 152 ms | **153 ms** |
+| `--snapshot-blob` 启动 | 60 / 59 / 47 ms | **59 ms** |
+
+省 **94 ms / 61%**，快照 blob 6.3 MB。
+
+**坏消息**：dsh 的入口是 **ESM**（`package.json` 有 `"type": "module"`），
+而 `--build-snapshot` **内部用 CJS 路径执行入口脚本**：
+
+```
+$ node --build-snapshot --snapshot-blob esm.blob esm_snapshot_test.mjs
+/data/.../esm_snapshot_test.mjs:12
+import { createRequire } from 'node:module';
+^^^^^^
+
+SyntaxError: Cannot use import statement outside a module
+    at minimalRunCjs (node:internal/main/mksnapshot:207:16)
+```
+
+报错里那个 `minimalRunCjs` 就是铁证：快照构建器只会按 CJS 跑入口。
+**V8 startup snapshot 不捕获 ESM 的 ModuleJob/ModuleMap**（那是 per-realm 运行时结构），
+所以即使绕过入口限制，ESM 模块图也进不了快照。
+
+要让快照生效，必须把整个 dsh 引擎先打包成单个 CJS 文件 —— 那是 bundler 工程
+（几百个 ESM 包 + 动态 import + 条件导出），不是配置项。
+
+### 16.2 SEA：blob 能生成，但同样只支持 CJS 入口
+
+```
+$ node --experimental-sea-config sea-config.json
+Wrote single executable preparation blob to sea_prep.blob
+$ ls -la sea_prep.blob
+-rw------- 1 root root 1961 sea_prep.blob      <- 只有 1961 字节（仅 CJS 入口本身）
+```
+
+SEA 的 `main` 字段同样要求 CJS。**CJS 里动态 `import()` ESM 是能工作的**
+（实测 `ESM_IMPORT_OK`），但 SEA 的价值在于「把代码打进二进制减少文件读取」，
+而 `import()` 出去的 ESM 仍然要从磁盘逐个加载 —— **收益归零**。
+
+### 16.3 结论
+
+| 方案 | 状态 | 卡在哪 |
+|---|---|---|
+| startup snapshot | ❌ 不可行 | `--build-snapshot` 只支持 CJS 入口；V8 快照不含 ESM 模块图 |
+| SEA | ❌ 不可行 | `main` 只支持 CJS；动态 import 的 ESM 仍走磁盘 |
+| 预编译字节码（`NODE_COMPILE_CACHE`） | ✅ **已生效** | 省 1112 ms / 24.5%，已在产线代码里 |
+| 打包成更少的文件（bundler） | ⬜ 未试 | 工程量大，且要与上游包结构解耦 |
+
+**所以「1.0 秒」目前没有已证路径**。能兑现的只有编译缓存那 1112 ms。
+剩下的空间在 node 自身的模块加载机制里（1.82 秒），要么改上游打包方式，
+要么接受 2.3 秒左右的实际下限。
+
+### 复跑命令
+
+```sh
+B=/data/data/app.dsh.mobile/files; E=$B/engine
+export LD_LIBRARY_PATH=$E/lib TMPDIR=$B/dsh-home/tmp
+
+# 16.1 快照（CJS 有收益）
+$E/bin/node --build-snapshot --snapshot-blob $B/snap.blob $B/snapshot_test.cjs
+$E/bin/node --snapshot-blob $B/snap.blob $B/snapshot_test.cjs
+
+# 16.1 快照（ESM 不支持）
+$E/bin/node --build-snapshot --snapshot-blob $B/esm.blob $B/esm_snapshot_test.mjs
+# -> SyntaxError: Cannot use import statement outside a module
+
+# 16.2 SEA
+$E/bin/node --experimental-sea-config $B/sea-config.json
+```

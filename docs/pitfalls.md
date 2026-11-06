@@ -464,3 +464,57 @@ zygote 的 `KILL` 会先于我们自己的 `TRAP` 生效 —— 我们的 SIGSYS
 **结论**：在模拟器上做容器功能验证时，必须用 `run-as app.dsh.mobile <runner>
 <rootfs> <interp> <guest> ...` 而不是走 App UI —— 后者会因为 zygote filter
 而必然失败。这与容器实现本身无关。
+
+## 32. X11 / Wayland 显示服务器在免 root 下起不来 —— 但我们的路线根本不需要它
+
+想在容器里跑 Xvfb 或 Wayland compositor 时，会在最开头就撞墙：
+
+```
+(EE) Fatal server error:
+(EE) Linking lock file (/tmp/.X99-lock) in place failed: Permission denied
+```
+
+`Xvfb -nolock` 也救不了：它**只允许 root 使用**（`Warning: the -nolock option
+can only be used by root`）。直接 `ln` 验证：
+
+```
+$ touch /tmp/q1 && ln /tmp/q1 /tmp/q2
+ln: /tmp/q2: Permission denied
+```
+
+**根因不在我们的容器**，而在 Android 平台：SELinux 对 `app_data_file` 完全
+禁止 `link` 权限。宿主侧用同一 uid 做同样操作一样失败：
+
+```
+$ run-as <pkg> sh -c 'cd /data/data/<pkg>/files && touch _h1 && ln _h1 _h2'
+ln: cannot create hard link from '_h1' to '_h2': Permission denied
+
+avc: denied { link } ... scontext=u:r:runas_app:s0 tcontext=u:object_r:app_data_file:s0
+     tclass=file permissive=0
+```
+
+而 X 服务器建 `.X<n>-lock` 必须用「写临时文件再硬链接到目标」的方式（保证
+原子性），所以必然失败。Wayland compositor 的 unix socket 也需要
+`/tmp/.X11-unix` 这类目录与锁机制，同样受阻。
+
+实测：**以 root 身份能起**（`-nolock` 生效，`xsetroot` 成功、`xwd -root` 拿到
+1231979 字节），**免 root 必然失败**。
+
+### 对我们的意义（这才是重点）
+
+我们**不需要任何显示服务器**。当前图形路线是：
+
+```
+EGL (pbuffer / surfaceless) → GLES 渲染 → glReadPixels → 共享文件 → App SurfaceView
+```
+
+全程零 X11、零 Wayland、零 compositor、零 unix socket。这既是限制也是优势：
+- 限制：拿不到「系统级窗口」，别的 X11 程序想直接显示得先有 X server。
+- 优势：**免 root 就能跑硬件加速渲染**，而依赖 X/Wayland 的方案在免 root 下
+  连 server 都起不来。
+
+要在容器里跑「真正的 X11 应用」，只有三条路：
+1. root（不满足免 root 前提）；
+2. 让 App 侧自己实现一个 X server（工程量巨大）；
+3. 走 Xvfb 但把锁文件目录换到 SELinux 允许 link 的上下文（需要设备策略配合，
+   通用性差）。

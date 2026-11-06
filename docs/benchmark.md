@@ -1394,3 +1394,54 @@ Map 查找 + wrapper 调用与 V8 内联失效抵消。
 > 注：`fs` 包装必须 `Object.assign(wrapped, orig)` 保留静态属性，
 > 否则 `dsh-app-boot` 的 `realModuleDirectory` 调 `realpathSync.native` 报
 > `TypeError: realpathSync.native is not a function` 直接崩启动（实测踩过）。
+
+### 6.14 预置编译缓存随 APK 分发：唯一实测有效的冷启优化
+
+§6.13 已经把参数级优化全部否证完了。剩下唯一能动的是**让首次启动就命中缓存**。
+
+**问题**：编译缓存是本地生成的。新装 APK 的用户第一次启动必然没有缓存，
+那一轮就慢 840ms。
+
+**做法**：真机跑一轮引擎 → `tar czf` 出 1281 个文件 → 转 zip 打进 APK →
+首次冷启前从 assets 解到 `$DSH_HOME/.node-compile-cache`。
+
+**实测（模拟器 x86_64，交替 A/B 各 3 轮）**
+
+| 状态 | 三轮 | 中位 |
+|---|---|---|
+| 有预置缓存 | 3184.0 / 3357.4 / 3714.8 | **3357.4 ms** |
+| 无缓存 | 3664.3 / 4197.9 / 4746.5 | **4197.9 ms** |
+
+→ **省 840.5 ms（25.0%）**。这一条不依赖真机，因为缓存命中与 CPU 架构无关
+（只与 node 版本 + process.arch 相关，两者都已匹配）。
+
+**体积代价**：3.17 MB（zip，`compresslevel=9`）/ 7.86 MB 解压 / 1281 个文件。
+tgz 只要 2.55 MB，但 tar 路线走不通（见下）。
+
+**三条硬约束（都是实测出来的）**
+
+1. **目录名 `v<node版本>-<process.arch>-<hash>-0` 两段都不能改**。
+   把 `x64` 改成 `arm64` 后：耗时 **5715.8 ms**（= 无缓存水平），
+   且 Node 自己又新建了一个 `x64` 目录 —— 它按 `process.arch` 拼名字找缓存。
+2. **已有当前版本目录就跳过**。否则每次冷启都白解 1281 个文件。
+3. **版本从 node 二进制头部读，不执行它**。冷启路径不能多一次 fork
+   （这也是 §6.13 里 `command -v node` 被改成静态文件检查的同一个原因）。
+
+**为什么不用容器里的 tar（这条值得单独记）**
+
+第一版实现是「tar.gz + 容器内 `tar xzf /eng/...`」，**它永远不可能成功**：
+
+`app/src/main/java/app/dsh/mobile/engine/EngineConfig.kt` 的
+`linuxContainerArgv()` 只返回三样东西 ——
+
+```kotlin
+return listOf(runner.absolutePath, rootfs.absolutePath, interp)
+```
+
+**一条 `-m` 挂载都不加**。所以 `LinuxContainerRunner.shell()` 起的容器里
+既没有 `/eng` 也没有 `/dsh`（实测容器内 `ls /eng` → No such file or directory）。
+`-m` 只在 `LinuxEngineLauncher` 和 `buildTerminalArgv` 那两条路径上加。
+
+改用纯 Kotlin `ZipInputStream` 之后：更快、不要求 rootfs 就绪、
+也不占 `LinuxContainerRunner` 那个只有 3 个名额的 Semaphore（冷启路径上
+抢名额会让真正要紧的调用白等）。

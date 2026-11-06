@@ -766,3 +766,74 @@ tcontext=u:object_r:app_data_file:s0 tclass=file permissive=0`，
 **X11 专属的第二道限制**；任何 AF_UNIX 服务的**第一道**限制都是本文这条路径
 翻译缺失。wayland 路线不需要 `link()`，所以走 wayland compositor 可以绕开
 X11 那道。
+
+## 36. headless 后端默认 noop 渲染器 —— 窗口建了但什么都没画
+
+**症状**：`weston-debug scene-graph` 明明列出了 view（窗口存在、位置尺寸都对），
+但截图拿不到内容；`weston-screenshooter` 报 `Assertion failed: width > 0`。
+
+**原因**：`--backend=headless-backend.so` 的 `--renderer` 默认是 `noop`
+（名字就写着 "No-op renderer for testing only"）。`noop` 只走合成流程、不算像素，
+所以 view 有几何信息但缓冲区里没有内容。
+
+**修法**：
+
+```sh
+weston --backend=headless-backend.so --renderer=pixman ...
+# 日志里应出现：Using Pixman renderer
+```
+
+**验证**（模拟器 dsh34 / x86_64）：
+
+```
+[15:01:11.290] Using Pixman renderer
+[15:01:11.290] Output 'headless' enabled with head(s) headless
+```
+
+加上 `--renderer=pixman` 后 scene-graph 才有真实缓冲区（`SHM buffer` +
+`format: 0x34325241 ARGB8888`），窗口内容才可能被抓出来。
+
+### 顺带记录：weston 14 的 capture 授权限制
+
+即使渲染器换成 pixman，`weston-screenshooter` 仍报
+`Output capture error: unauthorized`。这是 weston 14 起 `weston_capture_v1`
+的**授权模型**：能力只授予 screen-share 模块拉起的 RDP 客户端，第三方工具
+（screenshooter / grim）一律拒绝。`--modules=screen-share.so` 加载模块本身
+不足以授权，需要走它的 RDP/pipewire 输出链路。
+
+**结论**：想在容器内验证「窗口里画了什么」，别指望 weston 的截图工具。
+两条可行路径：
+1. 让客户端的 `wl_shm` 池落成真实文件（LD_PRELOAD 一份 `memfd_create` 替身，
+   把池子建在 `$rootfs/tmp/` 下，宿主直接读那些 .bin）。**未实测**——容器里
+   没有 gcc，装不上编译器。
+2. 走 weston 自己的 `weston_capture_v1`（需要写一个绑定该协议的客户端程序）。
+
+**但更重要的判断**：这两条都不是产品路径。产品要的是「容器内 GUI 程序的画面
+进 App」，而这条链路我们**已经用另一套机制解决过** —— 容器内的 GL 程序直接用
+`lib/dsh_gl` 把帧写进共享文件，App 侧 `LinuxFrameSurface` mmap 同一个文件贴到
+SurfaceView。compositor 截图的困难不影响那条路径。
+
+### 关键实测：GUI 窗口确实在容器内合成出来了
+
+```
+$ weston-debug scene-graph
+Weston scene graph at 31126.295404300:
+Output 0 (headless):
+	position: (0, 0) -> (640, 360)
+	mode: 640x360@60.000Hz
+Layer 4 (pos 0x80000000):
+	View 0 (role xdg_toplevel, PID 29355, surface ID 3,
+	        top-level window 'simple-shm' of org.freedesktop.weston.simple-shm):
+		position: (307, 79) -> (557, 329)
+		outputs: 0 (headless) (primary)
+		SHM buffer
+			format: 0x34325241 ARGB8888
+			modifier: LINEAR (0x0)
+	View 0 (role (null), PID 29351, surface ID 16,
+	        background for output headless):
+		position: (0, 0) -> (640, 360)
+```
+
+`role xdg_toplevel` + `top-level window 'simple-shm'` = 一个真实的顶层窗口，
+250×250 居中（307,79 → 557,329），带 panel 与 background。**这是容器内
+GUI 应用开窗口可行性的直接证据**，且它依赖的就是本文档 #35 的 AF_UNIX 修复。

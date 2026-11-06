@@ -470,3 +470,65 @@ RESULT: UNIX_SOCKET_OK (fails=0)
 
 weston 相关 Alpine 包（已实测可装）：`weston`、`weston-backend-headless`、
 `weston-clients`、`weston-shell-desktop`、`grim`。
+
+## 9. 容器内 Wayland GUI 窗口（compositor + 真实客户端）
+
+前置：AF_UNIX 路径翻译（第 8 节）+ `--renderer=pixman`（见 pitfalls #36）。
+
+```sh
+# 1) 装（Alpine，已实测可装）
+apk add weston weston-backend-headless weston-clients weston-shell-desktop
+
+# 2) 起 compositor（headless + pixman，不开 X11、不需要 link()）
+mkdir -p /tmp/wl && chmod 700 /tmp/wl
+weston --backend=headless-backend.so --renderer=pixman        --socket=/tmp/wl/test --width=640 --height=360 --debug --log=/tmp/weston.log &
+
+# 3) 起一个真实客户端
+export WAYLAND_DISPLAY=/tmp/wl/test
+weston-simple-shm &
+
+# 4) 看合成结果
+weston-debug scene-graph
+```
+
+实测（模拟器 dsh34 / Android 14 / x86_64）：
+
+```
+[weston.log] Using Pixman renderer
+[weston.log] Output 'headless' enabled with head(s) headless
+[weston.log] Loading module '/usr/lib/weston/desktop-shell.so'
+[weston.log] launching '/usr/libexec/weston-desktop-shell'
+[weston.log] launching '/usr/libexec/weston-keyboard'
+
+[fs] /tmp/wl/test        srwxrwxrwx
+[fs] /tmp/wl/test.lock
+
+[scene-graph]
+	View 0 (role xdg_toplevel, PID 29355, surface ID 3,
+	        top-level window 'simple-shm' of org.freedesktop.weston.simple-shm):
+		position: (307, 79) -> (557, 329)
+		SHM buffer
+			format: 0x34325241 ARGB8888
+			modifier: LINEAR (0x0)
+	View 0 (role (null), PID 29351, surface ID 16,
+	        background for output headless):
+		position: (0, 0) -> (640, 360)
+```
+
+**这是「容器内能开 GUI 窗口」的直接证据**：`xdg_toplevel` 角色的顶层窗口、
+250×250 居中、带 panel 与 background，全部由容器内的 weston 合成。
+
+### 能力边界
+
+| 项 | 状态 |
+|---|---|
+| compositor 在容器内运行 | ✅ 实测 |
+| 真实 Wayland 客户端连上并建窗口 | ✅ 实测（scene-graph 有 xdg_toplevel） |
+| 客户端持续重绘 | ✅ 实测（`weston-simple-shm` 存活） |
+| 从 compositor 抓帧 | ❌ 未通（weston 14 的 `weston_capture_v1` 只授权 RDP 客户端；`grim` 要 `wlr-screencopy`，weston 不提供） |
+| 硬件 GPU 合成 | ❌ 未做（`pixman` 是 CPU 渲染；headless 后端没有 EGL 路径） |
+| X11 / Xvfb | ❌ 仍不可行（无 root 时 `link()` 被 SELinux 拒） |
+
+**注意**：产品不需要 compositor 抓帧。容器内 GL 程序的画面走
+`lib/dsh_gl` 的共享文件 + App 侧 `LinuxFrameSurface` mmap，那条路径与
+compositor 无关，已单独验证过（第 7 节）。

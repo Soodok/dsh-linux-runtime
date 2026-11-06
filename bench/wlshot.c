@@ -12,15 +12,24 @@
  * wlr-screencopy 是 wlroots 系（sway）的标准合成抓取协议，无授权限制。
  * 抓到的 ARGB8888 直接拷进共享文件，App 侧 LinuxFrameSurface 零改动就能显示。
  *
- * 用法：
- *   WAYLAND_DISPLAY=wayland-1 ./wlshot <sharepath> [timeout_ms]
+ * 两种模式：
+ *   单帧（默认）：抓一帧写文件就退出 —— 适合验收与一次性快照
+ *   持续（--loop N）：按间隔反复抓，seq 递增 —— 适合当「桌面镜像」用
  *
- * 输出契约：
+ * 用法：
+ *   WAYLAND_DISPLAY=wayland-1 ./wlshot <sharepath> [timeout_ms] [--loop [fps]]
+ *
+ * 输出契约（单帧）：
  *   WLSHOT_KV output=<w>x<h>
- *   WLSHOT_KV format=argb8888|other
- *   WLSHOT_KV copied=<n>
+ *   WLSHOT_KV format=0x<fmt>
+ *   WLSHOT_KV copied=1
  *   WLSHOT_KV bytes=<n>
  *   RESULT: WLSHOT_OK | WLSHOT_FAIL <stage>
+ *
+ * 输出契约（持续）：
+ *   WLSHOT_KV mode=loop fps=<n>
+ *   WLSHOT_KV frames=<k> elapsed_ms=<t>
+ *   RESULT: WLSHOT_LOOP_OK | WLSHOT_FAIL <stage>
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -153,6 +162,10 @@ int main(int argc, char **argv) {
     printf("WLSHOT_KV output=%dx%d\n", f_w, f_h);
     printf("WLSHOT_KV format=0x%x\n", f_format);
 
+    /* 输出尺寸固定下来：flush 模式尺寸变了没法原地换 buffer，直接退出比
+       静默画出错位画面好（App 侧 resize 走新的映射路径）。 */
+    unsigned out_w = (unsigned)f_w, out_h = (unsigned)f_h;
+
     /* 建共享文件（含 dsh_gl 头，格式与 LinuxFrameSurface.kt 一致） */
     size_t stride = (size_t)f_w * 4u;
     size_t pixbytes = stride * (size_t)f_h;
@@ -201,70 +214,126 @@ int main(int argc, char **argv) {
                                                       (int32_t)stride, f_format);
     wl_shm_pool_destroy(pool);
 
-    zwlr_screencopy_frame_v1_copy(fr, buf);
+    /* ---- 抓帧（单帧或持续）----
+     *
+     * --loop 模式下反复抓同一 output 写进同一共享文件、seq 递增。
+     * App 侧 LinuxFrameSurface 的脏判据就是 seq 变化，所以 wlshot 这样
+     * 就能当「容器桌面镜像」用，而不是只能拍一张快照。
+     *
+     * ★每帧都要新建 zwlr_screencopy_frame_v1 —— 协议规定一个 frame 对象
+     *   只能 copy 一次；但 wl_buffer 可以复用（ready 之后才允许下次 copy）。
+     */
+    int loop_mode = (argc > 3 && strcmp(argv[3], "--loop") == 0);
+    int loop_fps = 0;
+    if (loop_mode) {
+        loop_fps = (argc > 4) ? atoi(argv[4]) : 2;
+        if (loop_fps < 1) loop_fps = 1;
+        if (loop_fps > 60) loop_fps = 60;
+    }
 
-    for (spin = 0; spin < timeout_ms / 10 && !done; spin++) {
-        if (wl_display_roundtrip(disp) < 0) break;
-    }
-    if (failed || !f_ready) {
-        fprintf(stderr, "FAIL copy failed=%d ready=%d\n", failed, f_ready);
-        close(tfd); close(fd);
-        printf("RESULT: WLSHOT_FAIL copy\n");
-        return 11;
-    }
+    unsigned seq = 0;
+    int iter = 0;
+    int frames_ok = 0;
 
-    /* 从 tmp 映射读到共享文件。ARGB8888 小端字节序就是 B,G,R,A，
-       与 App 侧 Bitmap.Config.ARGB_8888 + copyPixelsFromBuffer 期望的
-       RGBA 顺序差一个通道 —— 逐像素换一下，避免 App 上颜色偏。 */
-    void *src = mmap(NULL, pixbytes, PROT_READ, MAP_SHARED, tfd, 0);
-    if (src == MAP_FAILED) {
-        fprintf(stderr, "FAIL src mmap: %s\n", strerror(errno));
-        close(tfd); close(fd);
-        printf("RESULT: WLSHOT_FAIL src\n");
-        return 12;
-    }
-    {
-        const unsigned char *s = (const unsigned char *)src;
-        size_t i;
-        /*
-         * ★alpha 必须显式写 255，不能从 XRGB8888 的第 4 字节抄。
-         *
-         * wlr-screencopy 在 headless/pixman 下给的格式是 WL_SHM_FORMAT_XRGB8888
-         * (0x1)，第 4 字节是 **X（未定义）**，实测同一个窗口内 alpha 全是 0、
-         * 窗口外是 255 —— 完全是垃圾。
-         *
-         * 而 App 侧 LinuxFrameSurface 用的是 Bitmap.Config.ARGB_8888 +
-         * copyPixelsFromBuffer，会**当真读 alpha**：抄过去 alpha=0 的窗口区域
-         * 会被当成全透明，用户在 App 里看到的是一片空白 ——
-         * 数据其实是对的，但画面消失，且不报任何错。
-         * 这个坑用「共享文件字节数正确 + magic 正确」查不出来，
-         * 必须逐像素看 alpha 才会发现。
-         */
-        for (i = 0; i + 3 < pixbytes; i += 4) {
-            pix[i + 0] = s[i + 2];  /* R */
-            pix[i + 1] = s[i + 1];  /* G */
-            pix[i + 2] = s[i + 0];  /* B */
-            pix[i + 3] = 255;       /* A —— 不抄 s[i+3] */
+    for (;; iter++) {
+        if (iter > 0) {
+            f_w = 0; f_h = 0; f_ready = 0; failed = 0; done = 0;
+            fr = zwlr_screencopy_manager_v1_capture_output(scm, 0, outputs[0]);
+            zwlr_screencopy_frame_v1_add_listener(fr, &frame_listener, NULL);
+            for (spin = 0; spin < timeout_ms / 10 && f_w == 0 && !failed; spin++) {
+                if (wl_display_roundtrip(disp) < 0) break;
+            }
+            if (failed || f_w <= 0) {
+                fprintf(stderr, "FAIL loop frame %d: no buffer event\n", iter);
+                break;
+            }
+            if (f_w != (int)out_w || f_h != (int)out_h) {
+                fprintf(stderr, "FAIL loop frame %d: size changed %dx%d -> %dx%d\n",
+                        iter, out_w, out_h, f_w, f_h);
+                break;
+            }
+        }
+
+        done = 0; f_ready = 0; failed = 0;
+        zwlr_screencopy_frame_v1_copy(fr, buf);
+
+        for (spin = 0; spin < timeout_ms / 10 && !done; spin++) {
+            if (wl_display_roundtrip(disp) < 0) break;
+        }
+        if (failed || !f_ready) {
+            fprintf(stderr, "FAIL frame %d: copy failed=%d ready=%d\n",
+                    iter, failed, f_ready);
+            break;
+        }
+
+        /* 从 tmp 映射读到共享文件。XRGB8888 小端字节序是 B,G,R,X */
+        void *src = mmap(NULL, pixbytes, PROT_READ, MAP_SHARED, tfd, 0);
+        if (src == MAP_FAILED) {
+            fprintf(stderr, "FAIL frame %d: src mmap: %s\n", iter, strerror(errno));
+            break;
+        }
+        {
+            const unsigned char *s = (const unsigned char *)src;
+            size_t i;
+            /*
+             * ★alpha 必须显式写 255，不能从 XRGB8888 的第 4 字节抄。
+             *
+             * wlr-screencopy 在 headless/pixman 下给的格式是
+             * WL_SHM_FORMAT_XRGB8888 (0x1)，第 4 字节是 **X（未定义）**。
+             * 实测同一个窗口内 alpha 全是 0、窗口外是 255 —— 完全是垃圾。
+             *
+             * 而 App 侧 LinuxFrameSurface 用 Bitmap.Config.ARGB_8888 +
+             * copyPixelsFromBuffer，会**当真读 alpha**：alpha=0 的区域被当成
+             * 全透明，用户在 App 里看到的是一片空白 —— 数据其实是对的，
+             * 但画面消失，且不报任何错。
+             * 这个坑用「共享文件字节数正确 + magic 正确」查不出来，
+             * 必须逐像素看 alpha 才会发现（pitfalls #45）。
+             */
+            for (i = 0; i + 3 < pixbytes; i += 4) {
+                pix[i + 0] = s[i + 2];  /* R */
+                pix[i + 1] = s[i + 1];  /* G */
+                pix[i + 2] = s[i + 0];  /* B */
+                pix[i + 3] = 255;       /* A —— 不抄 s[i+3] */
+            }
+        }
+        munmap(src, pixbytes);
+
+        seq++;
+        frames_ok++;
+
+        /* 头最后写：seq 是「有新帧」的唯一判据，必须最后落 */
+        put_u32(hdr + 0, DSH_FRAME_MAGIC);
+        put_u32(hdr + 4, seq);
+        put_u32(hdr + 8, out_w);
+        put_u32(hdr + 12, out_h);
+
+        zwlr_screencopy_frame_v1_destroy(fr);
+        fr = NULL;
+
+        if (!loop_mode) break;
+        if (loop_fps > 0) {
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 1000000000L / loop_fps;
+            while (nanosleep(&ts, &ts) < 0 && errno == EINTR) { }
         }
     }
-    munmap(src, pixbytes);
-    close(tfd);
 
-    printf("WLSHOT_KV copied=1\n");
+    printf("WLSHOT_KV copied=%d\n", frames_ok);
+    printf("WLSHOT_KV seq=%u\n", seq);
     printf("WLSHOT_KV bytes=%zu\n", pixbytes);
 
-    /* 头最后写：seq 是「有新帧」的唯一判据，必须最后落 */
-    put_u32(hdr + 0, DSH_FRAME_MAGIC);
-    put_u32(hdr + 4, 1u);
-    put_u32(hdr + 8, (unsigned)f_w);
-    put_u32(hdr + 12, (unsigned)f_h);
-
+    if (fr) zwlr_screencopy_frame_v1_destroy(fr);
     munmap(map, total);
     close(fd);
+    close(tfd);
     wl_buffer_destroy(buf);
-    zwlr_screencopy_frame_v1_destroy(fr);
     wl_display_disconnect(disp);
 
+    if (frames_ok == 0) {
+        printf("RESULT: WLSHOT_FAIL no_frames\n");
+        return 11;
+    }
     printf("RESULT: WLSHOT_OK\n");
     return 0;
 }

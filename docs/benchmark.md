@@ -597,6 +597,31 @@ wlwin : WLWIN_KV compositor=4
 
 两轮连续跑都拿到 `frame_callback=1`，可重复。
 
+### 6.10.1 wlshot 持续抓帧（--loop）：画面镜像而不是快照
+
+App 侧 `LinuxFrameSurface` 的脏判据是共享文件头里的 **seq**，所以抓帧器必须
+持续递增 seq，否则画面会卡在第一次映射到的那张图上（**不报任何错**，
+看起来像「画面停住」）。见 pitfalls #46。
+
+```sh
+# 持续抓，8 fps，直到被杀
+WAYLAND_DISPLAY=wayland-1 /wlsrc/wlshot     /data/data/<pkg>/files/dshframe.bin 5000 --loop 8
+```
+
+实测帧率（模拟器 dsh34 / x86_64 / 1280×720 / pixman）：
+
+| 请求 | 4 秒内 seq 增量 | 实际帧率 |
+|---|---|---|
+| 2 fps | 8 | 2.0 |
+| 5 fps | 19 | 4.75 |
+| 10 fps | 37 | 9.25 |
+
+节流准确。上限受 pixman 软件合成 + screencopy 往返限制。
+
+**每帧都要新建 `zwlr_screencopy_frame_v1`**（协议规定一个 frame 对象只能
+copy 一次），但 `wl_buffer` 可以复用。输出尺寸中途变化时直接退出报错，
+不原地换 buffer —— 错位画面比失败难查。
+
 ### 6.11 图形栈的真实边界（llvmpipe vs 硬件）
 
 `--renderer=gl` 能起，但拿到的是软件渲染：

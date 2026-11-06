@@ -1543,3 +1543,84 @@ for (i = 0; i + 3 < pixbytes; i += 4) {
    语义差一个通道。
 3. **优先选无授权门槛的协议**。同样的「抓合成画面」，weston 要授权、
    wlroots 不要，选错要多花一整轮。
+
+---
+
+## #46 抓帧器必须是「持续服务」，单帧快照不能当画面镜像
+
+### 症状
+
+`wlshot` 单帧模式在验证时一切正常（`RESULT: WLSHOT_OK`、共享文件字节数正确、
+画面图像也对），但接到 App 上之后：
+
+**画面停住不动，只有刚点按钮那一刻的一张图。**
+
+### 根因
+
+App 侧 `LinuxFrameSurface` 的脏判据是共享文件头里的 **seq**：
+
+```kotlin
+val seq = m.getInt(4)
+if (seq == lastSeq) return false      // 没新帧，跳过整帧拷贝
+lastSeq = seq
+```
+
+单帧抓一次就退出 → seq 永远停在 1 → App 每帧都判定「没有新帧」→
+只画第一次映射到的那张图。**没有任何报错**，看起来像「画面卡住」。
+
+### 修法
+
+给 `wlshot` 加 `--loop [fps]`，每帧递增 seq：
+
+```c
+for (;; iter++) {
+    if (iter > 0) {
+        /* ★每帧都要新建 frame 对象：协议规定一个
+           zwlr_screencopy_frame_v1 只能 copy 一次。
+           但 wl_buffer 可以复用（ready 之后才允许下次 copy）。 */
+        fr = zwlr_screencopy_manager_v1_capture_output(scm, 0, outputs[0]);
+        zwlr_screencopy_frame_v1_add_listener(fr, &frame_listener, NULL);
+        ...
+    }
+    zwlr_screencopy_frame_v1_copy(fr, buf);
+    ...
+    seq++;
+    put_u32(hdr + 4, seq);        /* 头最后写：seq 是唯一判据 */
+    zwlr_screencopy_frame_v1_destroy(fr);
+    if (!loop_mode) break;
+    nanosleep(...);               /* 按 fps 节流 */
+}
+```
+
+### 实测帧率（模拟器 dsh34 / x86_64 / 1280×720 / pixman）
+
+| 请求 | 4 秒内 seq | 实际 |
+|---|---|---|
+| 2 fps | 8 | 2 帧/秒 |
+| 5 fps | 19 | ~4.75 帧/秒 |
+| 10 fps | 37 | ~9.25 帧/秒 |
+
+节流是准的。帧率上限受 pixman 软件合成与 screencopy 往返限制，不是节流不准。
+
+### 三个附带问题
+
+1. **两个 wlshot 抢同一文件会把 seq 搅乱** —— 起之前必须
+   `pkill -f 'wlshot .* --loop'`，停的时候也要一起杀（`stopFrameServer`）。
+2. **`nohup ... &` 之后必须等第一帧真落盘再报成功**。只 echo STARTED
+   就返回，UI 会说「已开始」但画面空白。正确做法是轮询 `[ -s $shared ]`。
+3. **Kotlin 原始字符串（`"""`）会吞 shell 变量** —— `$i` 会被当成 Kotlin
+   模板变量，报 `Unresolved reference: i`。必须写 `${'$'}i`。
+
+### 输出尺寸变化的处理
+
+`--loop` 中途如果 output 尺寸变了（比如 `swaymsg create_output`），
+**直接退出报错**，不要原地换 buffer：
+
+```c
+if (f_w != (int)out_w || f_h != (int)out_h) {
+    fprintf(stderr, "FAIL loop frame %d: size changed %dx%d -> %dx%d\n", ...);
+    break;
+}
+```
+
+静默画出错位画面比直接失败难查得多。App 侧尺寸变化走重新映射的路径。

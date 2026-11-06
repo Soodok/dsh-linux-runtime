@@ -873,3 +873,89 @@ adb shell "cat /proc/net/tcp | awk '{print \$2}' | grep -ci 3BF9"
 `install()` 执行前调一次 `ensureDnsProxy()`，避免「刚开 App、代理还在后台线程
 起、用户已点安装」的竞态。但这只是让代理"尽快起来"，不能改变「App 必须在」
 这个前提。
+
+## 38. 在容器里装大包会被 ActivityManager 杀掉 —— 不是 phantom killer
+
+**现象**：在设备上手工跑 `apk add nodejs`（14 个依赖，其中 `icu-data-full` /
+`nodejs` 是几十 MB 的大包），进度卡在 `(14/14) Installing nodejs` 十几分钟不动，
+最后进程消失、`DONE` 标记没写、`/usr/bin/node` 不存在。
+
+**判断依据**（关键，别往 phantom killer 上猜）：
+
+```sh
+adb shell "logcat -d | grep -E 'Killing.*app.dsh.mobile|phantom'" | tail
+# ActivityManager: Killing 30965:app.dsh.mobile/u0a204 (adj 0):
+#   stop app.dsh.mobile due to from pid 32189
+```
+
+`ActivityManager ... adj 0 ... stop app.dsh.mobile` = **Activity 全被销毁后进程被判
+可回收**，与 phantom process killer（那条日志是 `Excessive phantom processes`）
+是两回事。手工在 `root`/`run-as` 下跑容器时 App 界面不在前台，很容易踩到。
+
+**规避**：
+- 装大包前保持 App 在前台（或至少让它有活跃 Activity）。
+- 分批装，避免一次拉十几个大依赖。
+- 大包（`weston` 110 包 / 458 MiB、`nodejs` 14 包含 `icu-data-full`）在模拟器上
+  **实测极慢**（>15 分钟），不适合当自动化验证的一部分。
+
+**顺带记录：`apk` 被 `kill -9` 后会留下数据库锁**，之后所有 `apk` 操作报
+`ERROR: Unable to lock database: temporary error (try again later)`。清掉即可：
+
+```sh
+rm -f <rootfs>/lib/apk/db/lock
+```
+
+**顺带记录 2：手工解包 minirootfs 必须把绝对软链改成相对**，否则
+`LOADER: preload FAIL`。官方 minirootfs 的 applet 全是
+`cat -> /bin/busybox` 这种**绝对**链接，而软链内容不经过路径翻译
+（见 #30），内核按宿主根找 `/bin/busybox` → 不存在。App 的部署逻辑
+（`LinuxEnvironmentManager` 的 `linkPath` 重写）会自动改成相对，手工解包不会。
+
+改写时**必须只改真软链、不能碰 `busybox` 本体**，否则会把本体变成指向自己的
+死链（我第一次就写错了，症状同样是 `LOADER: preload FAIL`）：
+
+```sh
+cd <rootfs>
+for d in bin sbin usr/bin usr/sbin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do
+    [ -L "$f" ] || continue          # ← 关键：只碰 symlink
+    t=$(readlink "$f")
+    case "$t" in
+      /bin/busybox|*/bin/busybox)
+        case $d in
+          usr/bin|usr/sbin) ln -sf ../../bin/busybox "$f" ;;
+          sbin)             ln -sf ../bin/busybox "$f" ;;
+          *)                ln -sf busybox "$f" ;;
+        esac ;;
+    esac
+  done
+done
+# 验证：/bin/sh -c 'cat /etc/alpine-release; uname -m' → 3.22.2 / x86_64
+```
+
+## 39. 有 root 时容器可直接用真实外部 DNS —— 只有免 root 才依赖 App 的代理
+
+补 #37 的另一半。**之前把「容器必须靠 App 进程的 `LinuxDnsProxy`」当成了普遍
+约束，实测有 root 时不成立。**
+
+`root` 域（`u:r:su:s0` 或 adb root）下容器可以直连真实外部 DNS：
+
+```sh
+echo 'nameserver 223.5.5.5' > <rootfs>/etc/resolv.conf
+<runner> <rootfs> /lib/ld-musl-x86_64.so.1 /bin/sh -c 'nslookup mirrors.aliyun.com'
+# Server:  223.5.5.5
+# Address: 223.5.5.5:53
+# mirrors.aliyun.com canonical name = mirrors.aliyun.com.w.alikunlun.com
+# Address: 112.15.7.205
+```
+
+**所以两条路的分工**：
+
+| 场景 | DNS 走法 | 前提 |
+|---|---|---|
+| App 内（免 root，`untrusted_app`/`runas_app`） | App 进程的 `LinuxDnsProxy` + loader 双向端口改写（`DSH_DNS_PORT`） | **App 必须在跑**（见 #37） |
+| root / adb root | 直接写真实 nameserver，走真 53 | 有 root |
+
+排查时先确认**当前是哪个域**，别看错方向：`run-as app.dsh.mobile id` 会显示
+`context=u:r:runas_app:s0:cXXX,...`；`adb root` 后是 `u:r:su:s0`。

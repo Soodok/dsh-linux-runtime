@@ -1,0 +1,5 @@
+# 编译产物与运行期输出不入库
+out/
+_window.ppm
+_window.png
+*.raw

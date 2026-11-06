@@ -224,3 +224,32 @@ TLS/IE-TLSDESC 兼容、AHB gralloc backend、Wayland EGL 平台适配（含
 
 **两条路的性能差距在 1080p 下不足以否定后者**（148 fps vs 屏幕 60/120Hz）。
 对「手机里有个能跑图形程序的 Linux」这个产品形态，回读方案是更短的路径。
+
+### 6.5 端到端窗口路径（容器渲染 → memfd → 宿主可取）
+
+免 root 建不了 SurfaceFlinger layer，所以 App 侧只能「取像素 → SurfaceView
+贴图」。这条路的另一半是**回读出来怎么零拷贝交给宿主**。实测走 memfd：
+
+| 项 | 实测值 |
+| --- | --- |
+| `memfd_create` | 可用（Android 无 `/dev/shm`，`shm_open` 不可用，必须裸 syscall） |
+| 整帧写入（1080p / 7.91 MB） | **0.362 ms/frame**（2763 fps） |
+| `msync(MS_SYNC)` | 0.001 ms/次 |
+| `SCM_RIGHTS` 传 fd（往返） | **0.0111 ms/次** |
+| 端到端（720p：render + 回读进 memfd） | **3.325 ms/frame → 301 fps** |
+| 渲染内容正确性 | 落 PPM 后中心像素 RGB = `255,89,26`，整帧视觉确认纯橙 |
+
+**整条窗口路径的容器侧总成本**（1080p）：渲染 1.1~1.4ms + 回读 5.3~6.0ms
+= 6.4~7.3 ms/帧。IPC 那部分（0.36ms 写入 + 0.011ms 传 fd）相比之下可忽略。
+
+### 6.6 三个必须知道的坑
+
+1. **必须经 `sh -c` 触发**。直调 `dsh_alpine <rootfs> <interp> /gpu_probe` 会按
+   musl 装载，报 `__libc_init: symbol not found`；只有容器内再发起一次 `execve`
+   才命中 bionic 直通分支。
+2. **不能静态链接 libEGL**。`-lEGL` 会在 bionic 非 zygote 进程里触发
+   `FORTIFY: pthread_mutex_lock called on a destroyed mutex` 直接 abort。
+   必须 `dlopen` + `dlsym`；`printf` 同样要走裸 `write()`。
+3. **输出文件路径必须显式传**。程序跑在 cleaner（bionic 环境）里，
+   bionic 的 `/tmp` 与容器内的 `/tmp` 不是同一个东西且通常不可写，
+   `fopen("/tmp/...")` 会静默失败（连文件都不出现）。

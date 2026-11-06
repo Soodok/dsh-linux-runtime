@@ -115,13 +115,22 @@ TAWC 是独立 App + `ando` 命令做桥接 `[官方]`。
    - **已有**：容器内 EGL/GLES 硬件渲染 + 画面回传 App（`lib/dsh_gl` + `LinuxFrameSurface`）；
      容器内 **weston headless compositor 能跑**，真实 Wayland 客户端能建出
      `xdg_toplevel` 顶层窗口（`[实测]` scene-graph 有 `top-level window 'simple-shm'`）。
-   - **仍缺**：① **硬件合成** —— headless 后端走 `pixman`（CPU），没有 EGL/GBM 路径，
-     真机 GPU 并未参与 compositor 合成；② **系统窗口（SurfaceFlinger layer）** ——
-     需要 app Binder，免 root 拿不到；③ **从 compositor 抓帧** —— weston 14 的
-     `weston_capture_v1` 只授权它自己的 RDP 客户端，`grim` 要的
-     `wlr-screencopy` weston 不提供；④ **XWayland** —— `link()` 被 SELinux 拒，
-     无 root 时 X11 路线不通（这也是我们选 wayland 而非 X11 的实际原因）。
-   TAWC 用 Smithay + libhybris fork 解决了 ②③④。**差距在最难的两块上**。
+   - **本轮新增**：**AHB 零拷贝渲染链路打通**（`[实测]`）——
+     `AHardwareBuffer` → `EGLClientBuffer` → `EGLImage` → GL texture → FBO
+     colour attachment → GPU 直接渲染进去，CPU 一次回读都不需要。
+     1080p **6.777 ms/帧 → 0.341 ms/帧（19.9 倍）**，像素校验收回
+     `255,89,26,255`（对齐 `glClearColor(1.0,0.35,0.1)`）、FBO COMPLETE。
+     这消掉了旧路径里占 83% 的 `glReadPixels`。
+   - **仍缺**：① **compositor 用硬件合成** —— 容器内 weston 走 `pixman`（CPU），
+     AHB 那条路目前是「App 自己的 GL 程序用」，还没接进 compositor 的 renderer；
+     ② **系统窗口（SurfaceFlinger layer）** —— 需要 app Binder，免 root 拿不到；
+     ③ **从 compositor 抓帧** —— weston 14 的 `weston_capture_v1` 只授权它自己的
+     RDP 客户端，`grim` 要的 `wlr-screencopy` weston 不提供；④ **XWayland** ——
+     `link()` 被 SELinux 拒，无 root 时 X11 路线不通（这也是我们选 wayland 的实际原因）；
+     ⑤ **AHB 跨进程交给 App 的 SurfaceTexture** —— 需 Kotlin 侧
+     `SurfaceTexture`/`HardwareRenderer`，未做。
+   TAWC 用 Smithay + libhybris fork 解决了 ②③④。**②③④仍是差距，
+   但 ①⑤ 已经看到具体路径了。**
 2. **发行版生态**：TAWC 用 Arch/Debian（glibc），能直接跑大量预编译程序。
    Alpine 是 musl，很多二进制要重编。
 3. **输入法/桌面集成**：TAWC 有 Android 键盘桥接、任务管理器、桌面快捷方式。
@@ -150,6 +159,12 @@ TAWC 是独立 App + `ando` 命令做桥接 `[官方]`。
 「双架构」、「App 内嵌共享数据」、「AF_UNIX + compositor 能跑」这些点；
 TAWC 多出的是「系统窗口 + 硬件合成 + glibc 生态」这三块大而硬的点。
 
-**边界变化（本轮更新）**：图形栈的差距从「我们没有 compositor」缩小到
-「我们有 compositor 但不接硬件合成、也不进 SurfaceFlinger」。**壁垒没有建立，
-但第一道门槛已经跨过** —— 容器内能跑 GUI 程序这件事，从「不能」变成了「能」。
+**边界变化**：图形栈的差距经过三轮缩小 ——
+① 从「我们没有 compositor」→「有 compositor 且真实客户端能建 `xdg_toplevel` 窗口」；
+② 渲染性能从「必须 glReadPixels 回读、1080p 只能 147 fps」→
+   「AHB 零拷贝直写、1080p 2932 fps（19.9 倍）」；
+③ 剩下的是**把 AHB 接进 compositor 的 renderer** 和 **把 AHB 交给 App 的
+   SurfaceTexture** 这两段，路径已经清楚，不是未知。
+
+**壁垒仍未建立** —— 但「图形栈这块我们做不到」已经不成立了。
+TAWC 的优势从「有 vs 没有」变成「先做了多久」。

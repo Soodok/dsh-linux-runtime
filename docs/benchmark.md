@@ -815,3 +815,78 @@ for i, sid in enumerate(profile['samples']):
 **关键判断**：即使把插件框架和模块解析全砍掉，也只能到约 1.5 秒。
 **1.0 秒需要换掉加载模型（如 SEA / 单文件打包），不是调参数能到的。**
 这条结论写在这里，避免后续再在「调 flag / 裁插件」上反复尝试。
+
+## 14. AHB 零拷贝渲染：1080p 从 6.78 ms/帧 压到 0.34 ms/帧（19.9 倍）
+
+这是目前唯一一项**量化收益比以往所有优化加起来都大**的图形栈改进。
+
+### 为什么之前慢
+
+旧路径（`framesrv.c` / `lib/dsh_gl.c`）：
+
+```
+GPU 渲染 → glReadPixels（CPU 回读）→ 写文件/共享内存 → App mmap
+                  ↑
+              占 83% 的瓶颈
+```
+
+1080p 拆解：`render+finish` 1.125 ms + `glReadPixels` **5.630 ms** +
+`write` 0.014 ms = **6.777 ms/帧（147.6 fps）**。
+
+`glReadPixels` 慢是因为它强制 GPU→CPU 同步，并且要按行拷贝整帧 8.3 MB。
+
+### AHB 怎么绕过它
+
+`AHardwareBuffer` 是一块**GPU 可渲染、CPU 可映射、跨进程可传**的缓冲。
+GPU 直接写进去，App 侧拿同一块内存当纹理 —— **一次回读都不需要**。
+
+链路（四步，缺一不可，坑见 pitfalls #40）：
+
+```
+AHardwareBuffer_allocate
+  → eglGetNativeClientBufferANDROID      (AHB → EGLClientBuffer)
+  → eglCreateImageKHR(EGL_NATIVE_BUFFER_ANDROID)  (→ EGLImage)
+  → glEGLImageTargetTexture2DOES         (→ GL_TEXTURE_2D)
+  → glFramebufferTexture2D               (→ FBO color attachment)
+  → 正常绘制，像素直接落进 AHB
+```
+
+### 实测（模拟器 dsh34 / x86_64 / SwiftShader）
+
+| 分辨率 | render into AHB | AHB lock（一次性） |
+|---|---|---|
+| 640×360 | **0.044 ms/帧** | 0.765 ms |
+| 1280×720 | **0.129 ms/帧** | 4.381 ms |
+| 1920×1080 | **0.341 ms/帧** | 4.498 ms |
+
+像素正确性：`glClearColor(1.0, 0.35, 0.1)` → CPU lock 读回
+`center RGBA = 255,89,26,255`（精确对齐）。`FBO status = 0x8CD5`
+（`GL_FRAMEBUFFER_COMPLETE`）。
+
+### 对比表（1080p）
+
+| 路径 | 每帧 | 折合 fps | 相对 |
+|---|---|---|---|
+| 旧：render + glReadPixels + write | 6.777 ms | 147.6 | 1× |
+| **新：render into AHB** | **0.341 ms** | **2932** | **19.9×** |
+
+注意连 render 本身也快了（0.341 vs 1.125）—— 因为不再为「紧接着要回读」
+做额外同步。
+
+`AHB lock` 的 4.5 ms 是**一次性**的，只在 App 需要把 AHB 交给
+`SurfaceTexture` / `HardwareRenderer` 时发生，不是每帧成本。
+
+### 能力边界
+
+| 项 | 状态 |
+|---|---|
+| AHB 分配（GPU 渲染 + CPU 读） | ✅ 实测 |
+| AHB → EGLImage → GL texture → FBO | ✅ 实测（FBO COMPLETE） |
+| GPU 渲染进 AHB 后 CPU 读到正确像素 | ✅ 实测（255,89,26,255） |
+| 渲染吞吐 | ✅ 实测 1080p 0.341 ms/帧 |
+| **AHB 跨进程交给 App 的 SurfaceTexture** | ⬜ **未做** —— 需要在 Kotlin 侧建 `SurfaceTexture`/`HardwareRenderer`，并把 AHB 的 `native_handle` 或 fd 传过去。这是下一步 |
+| **真机 Adreno 验证** | ⬜ **未做** —— 全部数据来自 SwiftShader（CPU 渲染）。Adreno 上 render 会更快，但 `glEGLImageTargetTexture2DOES` 的路径需要重新确认 |
+| 硬件合成（不经过 App 贴图，直接进 SurfaceFlinger） | ❌ 仍需 app Binder，免 root 拿不到 |
+
+**结论**：容器内「GPU 零拷贝渲染」这半段完全打通且快了 20 倍；
+「交给 App 显示」那半段仍走原来的共享文件路径，尚未改用 AHB。

@@ -959,3 +959,141 @@ echo 'nameserver 223.5.5.5' > <rootfs>/etc/resolv.conf
 
 排查时先确认**当前是哪个域**，别看错方向：`run-as app.dsh.mobile id` 会显示
 `context=u:r:runas_app:s0:cXXX,...`；`adb root` 后是 `u:r:su:s0`。
+
+## 40. AHB 零拷贝：四个坑串成一条链，每个都只差一步
+
+AHardwareBuffer（AHB）能让 GPU 直接渲染进一块跨进程可见的缓冲，彻底省掉
+`glReadPixels`（1080p 占 83% 的那一步）。设备侧能力全都在（实测
+`/system/lib64` 里有 `AHardwareBuffer_allocate/lock/describe/getNativeHandle`，
+`libEGL.so` 扩展含 `EGL_ANDROID_get_native_client_buffer`），但要走通必须
+按顺序踩过这四个坑，**任何一个错了都会表现为「看起来通了其实没通」**。
+
+### 坑 1：`eglCreateContext` 传 NULL config → `EGL_BAD_CONFIG(0x3005)`
+
+```c
+void *ctx = eglCreateContext(dp, (void*)0, (void*)0, ctxAttr);   // ✗ 0x3005
+```
+
+必须先 `eglChooseConfig`：
+
+```c
+int cfgAttr[] = {
+    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+    EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE
+};
+EGLConfig cfg; EGLint n = 0;
+eglChooseConfig(dp, cfgAttr, &cfg, 1, &n);
+```
+
+### 坑 2：`eglMakeCurrent` 用 surfaceless → `EGL_BAD_MATCH(0x3009)`
+
+```c
+eglMakeCurrent(dp, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx);   // ✗ 0x3009
+```
+
+该 EGL 实现没开 `EGL_KHR_surfaceless_context`。**必须绑一个真实 pbuffer**：
+
+```c
+int pbAttr[] = { EGL_WIDTH, W, EGL_HEIGHT, H, EGL_NONE };
+EGLSurface surf = eglCreatePbufferSurface(dp, cfg, pbAttr);
+eglMakeCurrent(dp, surf, surf, ctx);                        // ✓
+```
+
+（`bench/framesrv.c` 一直走 pbuffer，所以它从没碰到这个问题 —— 这也是为什么
+「照抄成功案例」比「凭 EGL 规范推理」可靠。）
+
+### 坑 3：`AHardwareBuffer_lock` 少声明一个参数 → `-22(EINVAL)`
+
+真实签名是 **5 个参数**：
+
+```c
+int AHardwareBuffer_lock(AHardwareBuffer *buffer, uint64_t usage,
+                         int32_t fence, const ARect *rect, void **outVirtualAddress);
+```
+
+漏掉 `rect` 时调用方按 4 参压栈，被调方从错误位置取 `rect` → 返回 `-22`。
+**编译不报错**，只是永远锁不上。这个错最隐蔽。
+
+另外 `usage` 必须与申请时一致：申请 `CPU_READ_OFTEN`(0x2) 就传 0x2；
+传 `CPU_READ_RARELY`(0x1) 同样 `-22`。
+
+### 坑 4（最关键）：只把 AHB 变成 EGLClientBuffer 不等于渲染进 AHB
+
+```c
+void *cbuf = eglGetNativeClientBufferANDROID(ahb);   // 拿到 client buffer
+glClear(...);                                        // ✗ 画在 pbuffer 上！
+```
+
+实测症状：**整个探针打印 `RESULT: AHB_OK`，但 CPU lock 读回的 center RGBA 是
+`0,0,0,0`** —— 渲染落在当前绑定的 pbuffer surface 上，AHB 那块内存一个字节都没被写。
+这就是典型的「以为通了其实没通」。
+
+必须走完整四步把 AHB 挂成 FBO 的 colour attachment：
+
+```c
+/* 1. AHB -> EGLClientBuffer */
+void *cbuf = eglGetNativeClientBufferANDROID(ahb);
+
+/* 2. EGLClientBuffer -> EGLImage（target 必须是 EGL_NATIVE_BUFFER_ANDROID=0x3140） */
+int imgAttr[] = { EGL_IMAGE_PRESERVED_KHR, 1, EGL_NONE };
+EGLImage img = eglCreateImageKHR(dp, EGL_NO_CONTEXT,
+                                 EGL_NATIVE_BUFFER_ANDROID, cbuf, imgAttr);
+
+/* 3. EGLImage -> GL texture */
+GLuint tex; glGenTextures(1, &tex);
+glBindTexture(GL_TEXTURE_2D, tex);
+glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+
+/* 4. texture -> FBO attachment */
+GLuint fbo; glGenFramebuffers(1, &fbo);
+glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                       GL_TEXTURE_2D, tex, 0);
+/* 必须检查 status == GL_FRAMEBUFFER_COMPLETE(0x8CD5) */
+```
+
+### 验证：四步全通 + 像素正确 + 量化
+
+```
+nativewindow ok
+AHB symbols ok (lock=0x... unlock=0x...)
+AHB allocated 640x360 ahb=0x...
+AHB describe: 640x360 fmt=0x1 usage=0x302 stride=640
+EGL 1.4 vendor=Android
+EGL_ANDROID_get_native_client_buffer: present
+EGLConfig chosen n=1 cfg=0x5
+pbuffer surface = 0x... (err=0x3000)
+GL_RENDERER=Android Emulator OpenGL ES Translator (Google SwiftShader)
+EGLClientBuffer from AHB = 0x...
+EGLImage from AHB = 0x...
+texture=1 bound to EGLImage
+FBO=1 status=0x8cd5 (0x8CD5=COMPLETE)
+cleared into AHB
+center RGBA = 255,89,26,255          ← 对齐 glClearColor(1.0, 0.35, 0.1)
+render into AHB: 0.341 ms/frame (100 frames)   ← 1080p
+AHB lock: 4.498 ms
+RESULT: AHB_OK
+```
+
+三档分辨率实测（模拟器 dsh34 / x86_64 / SwiftShader）：
+
+| 分辨率 | render into AHB | AHB lock（一次性） |
+|---|---|---|
+| 640×360 | 0.044 ms/帧 | 0.765 ms |
+| 1280×720 | 0.129 ms/帧 | 4.381 ms |
+| 1920×1080 | **0.341 ms/帧** | 4.498 ms |
+
+**与旧路径对比（1080p）**：旧 6.777 ms/帧（render 1.125 + glReadPixels 5.630 +
+write 0.014）→ 新 **0.341 ms/帧**，**19.9 倍**。而且连 render 本身也快了
+（0.341 vs 1.125），因为不再为回读做同步。
+
+`AHB lock` 那 4.5ms 是**一次性**的（App 只在需要把 AHB 交给 SurfaceTexture 时锁），
+不是每帧成本。
+
+### 一个遗留现象（不影响结论）
+
+探针结尾稳定打印
+`FORTIFY: pthread_mutex_lock called on a destroyed mutex (0x...)`。
+这是 bionic 在进程退出阶段对已销毁 mutex 的检查（`glFinish` 后 EGL 已开始
+teardown），发生在 `RESULT: AHB_OK` **之后**，不影响任何测量数据。
+真机（Adreno）上未验证是否同样出现。

@@ -1970,3 +1970,37 @@ magic=0x4D415246 seq=151 w=1280 h=800 size=4096016 expect=4096016
 共享文件是 RGBA（4 字节/像素），写 PNG 时 `color type` 必须是 **6**。
 用 2（RGB）会得到「Unsupported or malformed image data」，而 PNG 结构与
 CRC 全部合法 —— 又一次「结构正确 ≠ 内容正确」。
+
+### 6.23 dshgui vm-* 统一入口（AI 侧 API 的实测数据）
+
+原先有两条割裂的路径：`dshgui` 管 X11 程序，QEMU 虚拟机要自己写 monitor
+命令加 `qscreensrv`。AI 记两套容易错，而且 vm 那条路要自己算相对位移。
+现已并入同一个入口，X11 与虚拟机两套环境互不干扰。
+
+| 命令 | 实测输出 | 说明 |
+|---|---|---|
+| `vm-start` | `started pid=13543 monitor=127.0.0.1:4493` | 端口自动顺延（4492 可能撞 TIME_WAIT） |
+| `vm-status` | `running`，`P6 1280 800 255` | PPM 头 3 行，只看前 2 行会漏分辨率 |
+| `vm-capture` | `captured 10986 bytes` | 1280×800 PNG |
+| `vm-key h e l l o` | 变化 **158** 像素，`x 0..47 y 594..607` | 6 格 × 8px = 48px ✓ |
+| `vm-type "OK"` | 变化 **116** 像素，`x 40..63 y 594..607` | 接上 48px 之后，24px = 3 格 |
+| `vm-stop` | `stopped`，`after-stop=0` | 按 PID 精确杀 |
+
+**判据设计**：两次注入的变化区域在 x 轴上**准确衔接**（0..47 → 40..63），
+这证明字符是**顺序追加**的，而不是覆盖同一格或光标闪烁。
+只测「一次注入有变化」不够 —— 光标闪烁也会产生变化，且只占 1 格。
+
+**四个设计取舍（都踩过）**
+
+1. **取画面用 `screendump` 不用 VNC** —— VNC 在 guest 未 `drmModeSetCrtc`
+   时报 `desktop 0x0`，只写出 16 字节帧头。多次实测都如此（QEMU 10 + `-vga std`）。
+2. **`screendump` 的文件参数必须写相对名** —— HMP 把路径里的 `/` 当**除号**
+   解析，报 `invalid char 't' in expression`。
+3. **`vm-stop` 按 PID 精确杀** —— `pkill -f qemu-system` 会匹配到调用它的
+   脚本自身（命令行里含该串），实测把整个 `.sh` 一起杀掉，表现为「脚本无输出」。
+4. **`vm-click` 用「先大力回左上角再相对移动」模拟绝对定位** ——
+   HMP 的 `mouse_move` 本身只有相对位移，没有绝对定位命令。
+
+**仍未验证**：`vm-click` 在 fbcon 下**没有可观测判据**（guest 没有图形桌面，
+鼠标事件无人消费）。要等 guest 里跑起 X/Wayland 才能证明点击真的生效。
+这一条明确标注为未验证，不算成果。

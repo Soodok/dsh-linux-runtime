@@ -1445,3 +1445,43 @@ return listOf(runner.absolutePath, rootfs.absolutePath, interp)
 改用纯 Kotlin `ZipInputStream` 之后：更快、不要求 rootfs 就绪、
 也不占 `LinuxContainerRunner` 那个只有 3 个名额的 Semaphore（冷启路径上
 抢名额会让真正要紧的调用白等）。
+
+### 6.15 预置缓存必须按「实际要跑的那个 node」生成
+
+§6.14 记录的是 840ms / 25% 的收益（在 `engine/bin/node` 上测得）。但把它接进
+产线时发现**收益归零**，根因是版本张冠李戴。
+
+**两条不同的 node**
+
+| 场景 | 实际执行的 node | 版本 | 缓存目录名 |
+|---|---|---|---|
+| 原生模式 | `engine/bin/node`（bionic） | v24.18.0 | `v24.18.0-x64-cf738c9d-0` |
+| **Linux 模式** | 容器内 `/usr/bin/node`（musl） | **v22.23.4** | `v22.23.4-x64-9ac5647c-0` |
+
+（Linux 模式的 node 路径见 `LinuxEngineLauncher.NODE_IN_CONTAINER = "/usr/bin/node"`）
+
+**版本与构建指纹都不同** —— 目录名最后那段 hash（`cf738c9d` vs `9ac5647c`）
+是 node 自身的构建指纹，跨构建不可复用。
+
+**后果**：包是按 v24 打的，Linux 模式跑 v22。seed 照解 958~1281 个文件
+（6.88MB），Node 一个都不认，磁盘白占。A/B 实测：
+
+| 状态 | 三轮 | 中位 |
+|---|---|---|
+| 有包（版本错） | 3894.3 / 4328.2 / 5003.3 | **4328.2 ms** |
+| 无缓存 | 4069.7 / 4275.1 / 4945.0 | **4275.1 ms** |
+
+→ **−53.1 ms，两组完全重叠 = 零收益**。
+
+**修法两条**
+
+1. **按容器 node 重新生成包**：958 个文件 / 6.88MB 原始 / **2.66MB zip**，
+   目录名 `v22.23.4-x64-9ac5647c-0`。
+2. **加版本交叉校验**：`seededCachePrefix()` 拿到包内版本后，与实际 node
+   的 `--version` 比对，不符就跳过（返回 null），不再写一堆无用文件。
+   取 live 版本只能靠执行 `node --version` —— 不能读二进制头部（pitfalls #49）。
+   这次 fork 可接受：只发生在部署阶段（`ensureDeployed`），不在冷启路径上。
+
+**通用教训**：凡"预生成物 + 版本目录"这类机制，**生成口径必须与实际消费方一致**。
+这里两者同名（都叫 node）但来自不同构建，是最容易张冠李戴的一类。
+判断方法：直接问消费方自己（`--version`），不要从另一个来源推断。

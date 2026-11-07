@@ -2004,3 +2004,44 @@ CRC 全部合法 —— 又一次「结构正确 ≠ 内容正确」。
 **仍未验证**：`vm-click` 在 fbcon 下**没有可观测判据**（guest 没有图形桌面，
 鼠标事件无人消费）。要等 guest 里跑起 X/Wayland 才能证明点击真的生效。
 这一条明确标注为未验证，不算成果。
+
+### 6.24 vm-click 打通：四层障碍与 PS/2 包级判据
+
+这一项之前被我标成「未验证」，理由是「fbcon 下没有可观测判据」。**那个判断只对了一半** ——
+真正的问题是有四层障碍没排掉，而不是没有判据。
+
+**四层障碍（依次踩穿）**
+
+| 层 | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | guest 里没有鼠标设备 | QEMU 默认不给 | `-device usb-tablet` |
+| 2 | 加了 usb-tablet 还是没有 | `qemu-xhci` 在 TCG+SeaBIOS 下**内核枚举不到**（`usbcore: registered new interface driver usbhid` 有，但设备列表空） | 改 `-device usb-ehci` |
+| 3 | usb-ehci 还是没有 | 这套内核的 USB/输入栈**全是 `=m`**：`ehci-hcd` `ehci-pci` `hid` `usbhid` `hid-generic` `mousedev` `evdev` | initrd 里按顺序 insmod |
+| 4 | 设备都在，读不到事件 | **读错了文件**：`/dev/input/event1`（evdev）在这套配置下不产事件 | 读 `/dev/input/mice`（PS/2 协议） |
+
+**判据：guest 侧 PS/2 包级解码**
+
+单次左键点击后，guest 的 `/dev/input/mice` 读出：
+
+```
+原始字节序列: 9 0 0 8 0 0
+→ 2 packets: [9:L,0,0] [8:release,0,0]
+RESULT: VMCLICK_VERIFY_OK packets=2
+```
+
+PS/2 鼠标包 3 字节，`byte0` 位含义：
+- `bit0` 左键、`bit1` 右键、`bit2` 中键
+- `bit3` **固定同步位**（恒为 1，用来识别包边界）
+
+所以 `0x09 = 0b1001` = 同步位 + 左键按下；`0x08 = 0b1000` = 同步位 + 全部松开。
+dx/dy 都是 0 —— `usb-tablet` 是绝对坐标设备，不发相对位移。
+
+**判据强度**：单次点击**恰好 2 个包**，不是 1 个也不是 3 个。
+这个计数精确性才是判据，比「读到非零字节」强得多。
+
+**★一个假绿教训**
+
+上一版判据写成 `EV=$(...| tr -d ' \n')`，把 timeout 打印的 `Terminated`
+也算成事件字节，得到 `event_bytes=11` **看起来像成功**。
+改成只认数字并剔除 `od` 的偏移列之后，非零项计数才是真事件。
+**凡是拿文本输出当数值判据，都必须显式剔除非数值字符。**

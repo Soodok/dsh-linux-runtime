@@ -20,7 +20,8 @@
 # 用法：
 #   sh qemu_boot.sh [rootfs] [runner] [serial|screen]
 #     serial  只出串口日志（快，用于验证 guest 起没起）
-#     screen  额外把真实屏幕 dump 成 PNG（慢，需等 45s 让 fbcon 切模式）
+#     screen  额外把真实屏幕 dump 成 raw framebuffer fb.raw（慢，需等 45s
+             让 fbcon 切模式）。raw 需自行转 PNG，脚本不做转换。
 set -u
 
 R="${1:-/data/local/tmp/rf}"          # rootfs（x86_64 minirootfs）

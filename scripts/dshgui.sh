@@ -234,8 +234,14 @@ cmd_vm_start() {
 
     cd /tmp || exit 3
     if [ -n "$iso" ]; then
+ # ★必须带 usb-ehci + usb-tablet：
+ #   默认 QEMU 不给 guest 鼠标设备，
+ #   guest 里 /proc/bus/input/devices 只有键盘。
+ #   是 usb-ehci 不是 qemu-xhci —— 后者在
+ #   TCG+SeaBIOS 下内核枚举不到。
         setsid qemu-system-x86_64 -m "$mem" -vga "$vga" -display none \
             -monitor "tcp:127.0.0.1:$port,server,nowait" \
+            -device usb-ehci -device usb-tablet,id=tab0 \
             -accel tcg -cdrom "$iso" >/tmp/dshgui-vm.log 2>&1 &
     else
         [ -f /tmp/q.gz ] || {
@@ -245,6 +251,7 @@ cmd_vm_start() {
             -initrd /tmp/q.gz -append "console=tty0 rdinit=/init" \
             -vga "$vga" -display none \
             -monitor "tcp:127.0.0.1:$port,server,nowait" \
+            -device usb-ehci -device usb-tablet,id=tab0 \
             -accel tcg -L /usr/share/qemu >/tmp/dshgui-vm.log 2>&1 &
     fi
     vpid=$!
@@ -356,8 +363,18 @@ cmd_vm_type() {
 cmd_vm_click() {
     [ $# -ge 2 ] || { echo "dshgui vm-click: 需要 x y" >&2; exit 1; }
     vm_load || { echo "dshgui: 虚拟机未启动" >&2; exit 4; }
-    # HMP 的 mouse_move 是**相对**位移，没有绝对定位。
-    # 先大力回左上角，再相对移动到目标，然后按一下左键。
+    # 鼠标链路已实测通，判据是 guest 侧读 /dev/input/mice 的 PS/2 包：
+    #   单次左键点击 → 恰好 2 个包 [0x09 按下][0x08 松开]，bit3 同步位恒 1。
+    #
+    # 三个前提（缺任一都读不到事件，全部踩过）：
+    #   1. QEMU 带 -device usb-ehci -device usb-tablet（见 vm-start）
+    #   2. guest 里 insmod ehci-hcd/ehci-pci/hid/usbhid/hid-generic/mousedev/evdev
+    #      这套内核里它们全是 =m，不加载等于主板没有 USB 控制器
+    #   3. 读的是 /dev/input/mice（PS/2 协议），不是 /dev/input/event1 ——
+    #      evdev 路径在这套配置下不产事件，这是之前一直"读不到"的真因
+    #
+    # HMP 的 mouse_move 是相对位移。接了 usb-tablet（绝对坐标设备）后
+    # QEMU 会把相对位移换算成绝对位置，所以下面「先回左上角再相对移动」可用。
     {
         echo "mouse_move -10000 -10000"
         sleep 0.2

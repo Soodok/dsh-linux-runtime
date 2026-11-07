@@ -1578,3 +1578,48 @@ RESULT: BRIDGE_OK
 bionic bash 绝对路径），在 musl 里必 `REEXEC: preload FAIL`。
 要验产线部署结果，必须用 `-m /eng:` 之外的路径，或先让
 `deployLinuxAgentGates()` 真正跑过一遍。
+
+### 6.18 合成画面直通 App 的产线路径（两条起容器路径的 bind 差异）
+
+App 里有两条独立的「起容器」路径，bind 视图曾经不一致：
+
+| 路径 | 入口 | bind |
+|---|---|---|
+| 引擎 | `LinuxEngineLauncher.buildEngineArgv()` | `buildBinds()` 十几条（/eng /ws /dsh + /data/data /data/user /storage…） |
+| 执行器 | `LinuxContainerRunner.shell()` | `EngineConfig.linuxContainerArgv()`，**原来一条都没有** |
+
+后果：`LinuxActivity` 把宿主路径 `/data/data/<pkg>/files/dshframe.bin`
+传给容器内的程序时，引擎那条路能写、执行器那条路写不了 —— 而调用方
+不知道自己走在哪条上。实测：
+
+```
+captureCompositor() -> WLSHOT_NOSTART
+/tmp/wlshot.log: FAIL open /data/data/app.dsh.mobile/files/dshframe.bin:
+                 No such file or directory
+```
+
+修法是给执行器补 `/data/data` 一条挂载（不整表复制 `buildBinds`，两张表
+整表同步迟早分叉）。补上后同一套产线脚本立刻变成 `WLSHOT_STARTED`。
+
+端到端核色（模拟器 dsh34 / x86_64 / sway headless + pixman）：
+
+```
+disp=wayland-1  wlwin_kv=1
+共享文件 3686416 B = 16 + 1280*720*4     seq=86（持续递增）
+窗口 282x148 @ x 40..321, y 60..207：
+  x= 40 RGBA( 30, 89,225)   x=180 RGBA(142, 89,113)   x=321 RGBA(255, 89,  0)
+  x=110 RGBA( 86, 89,169)   x=250 RGBA(198, 89, 57)
+窗口外全黑，alpha 全 255
+```
+
+G 恒 89、R 30→255、B 225→0 正是 `wlwin` 写入的渐变；窗口外全黑说明
+合成层边界正确。三条结论缺一不可：
+
+1. **seq 递增**证明 `--loop` 真在持续抓帧（不是单帧快照，否则画面会永久静止）；
+2. **像素逐点符合写入值**证明抓的是真实合成结果（不是清屏色）；
+3. **窗口外全黑**证明抓的是 compositor 输出而不是某个客户端 buffer。
+
+启动顺序也踩过：必须先开窗口、等它 `xdg_surface.configure` 之后 commit，
+再起帧服务。反过来先起帧服务会抓到全黑帧。另外多个 compositor 会留下
+多个 `wayland-N` socket，`ls -t` 选最新的可能选到没人渲染的实例 ——
+同样表现为全黑且不报错。所以验证脚本每次先 `pkill` 并重建 `/tmp/wl`。

@@ -1765,3 +1765,37 @@ preread_ms=8000      (8380 个文件 / engine 共 633 MB)
 `modcount` 那一步因此失败（`ENOENT: lstat '/dsh'`）。
 本节数据来自重装前的 07:14–07:17 UTC 窗口，有效；
 后续步骤需要等 App 重新部署 engine 后才能继续。
+
+### 补充：App 自身的 boot step 计时（原生模式，环境刚恢复后的真冷态）
+
+`logcat` 里 `EngineSupervisor: boot step` 是 App 自己打的，比外部探针更贴近
+用户感知：
+
+```
+boot step orphan-reap:        81ms  (total 81ms)
+boot step home-owner-check:    1ms  (total 82ms)
+boot step guardian-restore:    0ms  (total 82ms)
+boot step parallel-preflight: 49ms  (total 131ms)
+boot step runtime-install:     7ms  (total 138ms)
+boot step hardssh-install:     1ms  (total 139ms)
+boot step user-data:          17ms  (total 156ms)
+boot step profile-plugins:     3ms  (total 159ms)
+boot step spawn:             155ms  (total 314ms)
+boot step health-poll:      2782ms  (total 3096ms)
+```
+
+两个结论：
+
+1. **`spawn` 只要 155ms** —— 容器/原生「起进程」这一步在总时长里可以忽略。
+   这印证了「容器层单进程开销 4ms/run」那节：容器本身不是瓶颈。
+2. **`health-poll` 2782ms 占了 90%** —— 这是等引擎「完全就绪」的轮询时间，
+   里面包含的就是 JS 模块解析 + 编译 + 插件激活。IO 慢（冷盘 +3.2~4.1 秒）
+   正是加在这一段上。
+
+所以冷启优化的唯一着力点就是 `health-poll` 这一段，而它 = CPU（约 3.7 秒，
+`--cpu-prof` 实测）+ IO（冷盘 3.2~4.1 秒）。两者都不能单独解决，必须并行
+优化 —— 或者干脆**不让用户看到它**（后台预热 + 首屏直出）。
+
+**注意**：上面的 `engine/bin` 里的 flusher 探针路径在新版 runtime 里已变化
+（`node-compile-cache-flusher.cjs` 不在 engine 根了），所以外部 `--require`
+方式暂时失效，本轮的原生冷热复测未能完成。App 自身的 boot step 计时不受影响。

@@ -2297,3 +2297,66 @@ adb shell "ls -Z <rootfs>/usr/bin/env <rootfs>/usr/bin | head -2"  # 链接本�
 
 三项任一不对，App 侧的 `File.exists()` 就会静默 false。
 
+
+## 63. cleaner 三连缺陷：fork+exec 后所有 bionic 程序全废（2026-11-07）
+
+**症状**
+
+容器里跑任何 bionic 二进制（NDK 编的程序、要走 Adreno 的图形程序）在
+**fork+exec 出来的子进程里**必然失败：
+
+```
+$ dsh_alpine ... /bin/sh -c '/bin/sh -c "/eprobe"'
+BIONIC: cleaner_exec FAIL
+/bin/sh: /eprobe: not found          (rc=127)
+```
+
+而同一命令**不套子 shell** 就成功。产线上 `python -m pip`、`npm run`、
+`make`、任何 `sh -c` 包装都会 fork+exec —— 等于所有图形程序在真实用法里全废。
+
+**三个独立缺陷叠在一起，缺一个都还是失败**
+
+1. **空请求杀 cleaner**。`cleaner_loop` 里 `if (n <= 0) { close(cfd);
+   exit_group(0); }` —— 客户端 connect 后立刻 close（探活就是这么干的）
+   就会把常驻 cleaner 打死。同一条命令里第二个 bionic 程序必然 FAIL。
+   修法：`continue` 回到 accept，不退出。
+
+2. **`/proc/net/unix` 只读了 8192 字节**。本机该文件实测 **20248 字节**，
+   我们的 cleaner 条目排在表尾，**永远落在缓冲之外**。所以
+   `grep dsh-cleaner /proc/net/unix` 明明看得到、代码就是扫不到。
+   修法：缓冲放大到 64KB **并循环读到 EOF**。
+
+3. **socket write 短写**。`if (wr != n) return -1` 在消息变大后（容器里
+   180 个环境变量拼进 8KB）静默失败。返回点在写之后、任何日志都打不出来
+   —— 这是最难查的一点。
+   修法：`while (wr >= 0 && wr < n)` 循环写满。
+
+**为什么 fork+exec 场景特别脆**
+
+`cleaner_start()` 受 `mode < 2` 保护，而子进程已继承父进程的 seccomp
+filter（`PR_GET_SECCOMP` 就是 2），所以它**永远不会启自己的 cleaner**；
+同时 `.data` 段在 `execveat` 重执行后已重置，`g_cleaner_on/pid/namelen` 全是 0。
+两条路都断了，只能靠 `cleaner_exec()` 入口现找现连兜底。
+
+**诊断血泪**
+
+- `ldr_write()` 直接裸 syscall 写 **fd 2**。嵌套 shell 里 fd 2 被重定向或关闭，
+  **整个 SIGSYS handler 的日志都写不出去** —— 我加了十几轮诊断全「看不到输出」，
+  误以为是代码没执行，其实是日志通道没了。
+- 部署验证必须比 md5。用 `cat > file` 覆盖运行中的二进制有各种时机问题，
+  我一度连续多轮测的都是旧产物，改代码越改越远。
+  **每次部署后 `md5sum` 对比本地产物，不一致就不要开始测。**
+
+**验收（四场景 + 环境，全部必须过）**
+
+```sh
+sh -c '/eprobe'                            # 1 单层基线
+sh -c '/eprobe; /eprobe'                   # 2 cleaner 复用
+sh -c '/bin/sh -c "/eprobe"'               # 3 嵌套（原失败点）
+sh -c '/bin/sh -c "/bin/sh -c \"/eprobe\""'  # 4 三层
+sh -c 'export MYTEST=deep; /bin/sh -c "/eprobe"'   # 5 嵌套 env 透传
+```
+
+第 5 条尤其重要：我曾为绕开「消息过长」把环境改成白名单转发
+（只留 LD_*/PATH/HOME/TMPDIR/LANG），结果用户 `export` 的变量全部丢失
+—— 那是比原缺陷更严重的行为回归。**真正该修的是写入端短写，不是砍内容。**

@@ -1961,6 +1961,53 @@ I EngineSupervisor: spawning engine in LINUX container:
 但 rootfs 解包由 App 自己做，本来就在 App 进程里。所以真正可疑的是
 「谁把它改成了 root 属主/无 MCS」，见 pitfalls #56。
 
+## #57 `Log.w(... + r.combined())` 会因 trim 变成空白，等于没有日志
+
+`Result.combined()` 的实现是 `append(stdout.trim())` + `append(stderr.trim())`。
+当子进程被信号杀死（stdout/stderr 都是空的），拼出来就是空字符串：
+
+```
+W LinuxEnv: bootstrap failed (will retry next boot):        ← 后面什么都没有
+```
+
+**这条空白日志把我引到「没网 / 镜像站挂了」方向，白查两轮。**
+加长后再看，一行就看出真因：
+
+```
+bootstrap failed (will retry next boot): rc=139 timedOut=false stdout=0B stderr=0B
+```
+
+`rc=139` = SIGSEGV。跟网络、跟包索引一点关系都没有 —— 是模拟器上 App 进程
+带 `Seccomp:2 / filters=1`，容器在其中必然崩。
+
+**规矩**：任何「执行外部进程并判成功/失败」的日志，必须同时打
+`rc` / `timedOut` / 两路输出长度。只打合并输出等于放弃诊断能力 ——
+「空输出 + 非零退出」和「成功但无输出」在合并字符串里长得一样。
+
+## #58 `apk add` 在索引缺失时会**自己 fetch**，不需要前置 `apk update`
+
+我曾判定「全新 minirootfs 没有包索引 → apk add 必失败」，并据此加了一次
+`apk update`。**那是假根因，已撤回。**
+
+实测（`var/cache/apk` 清空后）：
+
+```sh
+$ apk add --no-progress bash
+fetch http://mirrors.aliyun.com/alpine/v3.22/main/x86_64/APKINDEX.tar.gz   ← 自己抓
+(1/4) Installing ncurses-terminfo-base (6.5_p20250503-r0)
+...
+rc=0
+```
+
+当时之所以"失败"，是因为**没带 `DSH_DNS_PORT`**：musl 把 DNS 发到 53
+无人监听 → `temporary error (try again later)` → apk 把它回落报成
+`ca-certificates (no such package)`。这个回落报错极具误导性，看起来像
+「包里没有这个软件」而不是「DNS 不通」。
+
+带上端口后，**同样空索引，一次成功**。
+
+所以：不要为「索引」额外加一次联网。慢网/离线环境下那是白白多等一个超时。
+
 ## #56 在 root 域跑过容器后，rootfs 的属主与 MCS 上下文会被改写
 
 `chcon` 修复验证时观察到：rootfs 里 **4861 个文件属主是 `root:root`**，

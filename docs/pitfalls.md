@@ -1961,6 +1961,83 @@ I EngineSupervisor: spawning engine in LINUX container:
 但 rootfs 解包由 App 自己做，本来就在 App 进程里。所以真正可疑的是
 「谁把它改成了 root 属主/无 MCS」，见 pitfalls #56。
 
+## #59 `pkill -f <pattern>` 会匹配到运行它的 shell 自己 —— 把自己杀掉
+
+清残留进程时写 `pkill -f 'wlshot .* --loop'`，看起来没问题，实测：
+
+```sh
+$ sh -c 'echo BEFORE; pkill -f "wlshot .* --loop"; echo AFTER'
+BEFORE
+Terminated                    ← AFTER 永远不打印
+```
+
+`pkill -f` 匹配的是**整条 cmdline**，而这条 shell 自己的 cmdline 里就含
+`wlshot .* --loop` 这串字面量 —— 于是 pkill 把执行它的 shell 也杀了。
+
+**危害是静默的**：pkill 之后的所有语句都不执行。在我们的产线里，
+`captureCompositor()` 的写法是
+
+```sh
+pkill -f 'wlshot .* --loop'
+nohup ... /wlsrc/wlshot $shared 5000 --loop 8 >/tmp/wlshot.log 2>&1 &
+... 等首帧 ...
+echo WLSHOT_STARTED
+```
+
+pkill 自杀后，起帧服务、等首帧、报状态全被跳过 —— 用户点「抓合成画面」
+看起来什么也没发生，没有任何报错。
+
+**修法**：经典 `[x]` 技巧。
+
+```sh
+pkill -f '[w]lshot .* --loop'      # 正则匹配字面 wlshot
+```
+
+正则 `[w]lshot` 匹配字面 "wlshot"，而**字面量本身**是 `"[w]lshot"`，
+与自己不匹配，所以不会自杀。实测 `AFTER` 正常打印。
+
+**规矩**：任何 `pkill -f` / `pgrep -f` 的模式，首字符一律写成 `[x]` 形式。
+特别是当模式串同时出现在同一条命令里的时候。
+
+## #60 `--loop` 帧服务出错不能退出，必须重连
+
+`wlshot --loop` 原本每帧出任何错都 `break` 退出。后果链条：
+
+```
+compositor 重启 / 输出尺寸变化 / 某帧超时
+  → 帧服务进程永久退出
+  → 共享文件 seq 不再递增
+  → App 侧脏判据（seq 变化）永远不成立
+  → 画面永久静止，且没有任何报错
+```
+
+用户看到「画面卡住了」，不是「服务挂了」。这类静默失败在本项目里
+已经是第 N 次踩到，规矩统一为：**持续模式必须能自恢复，不能退出**。
+
+**改法**：
+- 单帧错误 → 计数 + 退避后继续（指数退避，上限 2s）
+- `wl_display_roundtrip < 0` → 标记 `failed = 2`，触发 `reconnect()`
+- 连续失败达上限（30 次）才放弃
+- 帧尺寸变化 → 重建共享文件，不退出
+- 成功一帧 → 计数清零
+
+**改这个补丁本身又踩了两个坑**：
+
+1. 重连失败后直接 `continue` → `reconnect()` 失败会把 `scm`/`outputs`
+   清成 NULL，下一轮 `capture_output(NULL, ...)` 段错误，进程无日志消失。
+   必须在内层 `while` 里重试到位或耗尽次数。
+2. 重连后 `buf` 属于旧 display 的 shm，已失效。必须置 NULL 且重建前判空，
+   否则 `wl_buffer_destroy` 悬垂指针。
+
+端到端实测（模拟器 dsh34 / x86_64 / sway headless + pixman）：
+
+```
+WARN loop frame 12: no buffer event (failed=2, consec=1)
+WARN loop frame 12: reconnected
+WARN loop frame 13: size changed 0x0 -> 1280x720
+seq: 12 -> 53 -> 61          ← 继续递增，画面恢复
+```
+
 ## #57 `Log.w(... + r.combined())` 会因 trim 变成空白，等于没有日志
 
 `Result.combined()` 的实现是 `append(stdout.trim())` + `append(stderr.trim())`。

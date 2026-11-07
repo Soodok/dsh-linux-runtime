@@ -1961,6 +1961,79 @@ I EngineSupervisor: spawning engine in LINUX container:
 但 rootfs 解包由 App 自己做，本来就在 App 进程里。所以真正可疑的是
 「谁把它改成了 root 属主/无 MCS」，见 pitfalls #56。
 
+## #62 cleaner 只能服务一次 + 看不到 export 的环境 —— bionic 程序在真实脚本里全废
+
+修完 #61 之后，`sh -c '/framesrv ...'` 单条命令能跑了。但真实使用是脚本：
+
+```sh
+export LD_LIBRARY_PATH=/eng/lib
+/prog_a           # ← 成功
+/prog_b           # ← 立刻 BIONIC: cleaner_exec FAIL / not found
+```
+
+一条命令里出现**第二个** bionic 程序就废。产线上「脚本里跑两个图形程序」
+「先探测再渲染」这类写法全部不可用。
+
+### 两个独立缺陷
+
+**① cleaner 是一次性进程**（`cleaner_loop` 只 `accept` 一次就 `exit_group`）
+
+原注释给的理由是「常驻会持有借来的 stdio，让 adb shell 的管道永不关闭、
+命令永不返回（实测 exit 124）」。这个观察本身没错，但**结论错了**：
+
+- adb shell 等的是它自己 fork 的 `sh`（我们的 guest），cleaner 是 loader
+  fork 出来的**兄弟**，不是 shell 的子进程，不该阻塞任何东西。
+- 真正的泄漏风险由 `PR_SET_PDEATHSIG` 兜住：父进程一死内核立刻 SIGKILL。
+- 而 stdio **必须保留** —— 孙进程继承 cleaner 的 fd 1/2，那是 bionic 程序
+  输出回终端的唯一路径。关掉就只剩 RC=0、GL 输出一个字看不到。
+
+改成 `for (;;)` 常驻循环后，任意多个请求都能服务。
+
+**② bionic 程序看不到 `export` 的环境变量**
+
+`g_envp_for_cleaner = envp` 在 `ldr_entry` 里赋值 —— 那是 cleaner 在**首次
+启动那一刻** fork 的快照。之后用户 `export` 的任何变量都进不去。
+
+实测对照极其清晰：
+
+```
+musl_child=[hello_from_export]      <= musl 程序看得到
+bionic_child=[]                     <= bionic（走 cleaner）看不到
+```
+
+后果：`LD_LIBRARY_PATH`、`HOME`、`PATH` 对 bionic 程序全部失效，表现为
+
+```
+CANNOT LINK EXECUTABLE "/eng/bin/node": library "libz.so.1" not found
+```
+
+—— 明明 `LD_LIBRARY_PATH=/eng/lib` 里就有那个库。
+
+**修法**：扩展 cleaner 的请求协议，把请求方**当前**的环境一起发过去。
+
+```
+path argv[1..]   ENV[1..]         （环境段在 argv 终止符之后）
+```
+
+接收侧优先用请求方环境，`ec == 0` 时退回启动快照（保持对老协议的兼容）。
+
+### 修复后实测（模拟器 dsh34 / x86_64）
+
+```sh
+$ dsh_alpine <rootfs> ... /bin/sh -c     'export MYTEST=two; /eprobe; echo ---SECOND---; /eprobe'
+PROBE_MYTEST=two
+PROBE_LDPATH=<absent>
+---SECOND---
+PROBE_MYTEST=two          <= 第二个也成功，且环境正确
+```
+
+两个 bionic 程序连续跑通，每个都拿到了 `export` 的变量。
+
+### 教训
+
+「单条命令能跑」不等于「脚本能跑」。验证时至少要覆盖：**同一条命令里连续
+两个** bionic 程序、以及**先 export 再跑**。
+
 ## #61 bionic 直通在自我重执行后失效 —— 产线上所有图形程序都跑不了（30 轮未发现）
 
 ### 症状

@@ -142,6 +142,20 @@ def main():
     ok(re.search(r"if \(!g_cleaner_on \|\| g_cleaner_pid <= 0\) return -1;", src) is not None,
        "C1 两个条件都在（这正是 B2 必要的原因）")
 
+    print("[E] cleaner 必须常驻（能连续服务多次请求）")
+    ok(re.search(r"static void cleaner_loop[^}]*for \(;;\) \{", src, re.S) is not None,
+       "E1 cleaner_loop 是 for(;;) 常驻循环，不是只 accept 一次")
+
+    print("[F] 请求方必须把自己的当前环境发给 cleaner")
+    ok("cleaner_exec(const char *hostpath, char **gargv, char **genv_cur)" in src,
+       "F1 cleaner_exec 接收 genv_cur（当前环境）")
+    ok(re.search(r"cleaner_exec\(hp, gargv, genvp\)", src) is not None,
+       "F2 调用点传 genvp")
+    ok(re.search(r"if \(genv_cur\) \{\s*for \(int i = 0; genv_cur\[i\]", src) is not None,
+       "F3 发送侧把环境段追加进 msg")
+    ok(re.search(r"char \*\*use_env = \(ec > 0\) \? ev : g_envp_for_cleaner;", src) is not None,
+       "F4 接收侧优先用请求方环境，空则退回启动快照（兼容）")
+
     print("[D] 不许只靠环境变量")
     # 旧做法：重执行分支里 g_cleaner_on = 0 之后紧跟 envp 扫描，没有探活
     ok(not re.search(r"g_cleaner_on = 0;\s*if \(envp\)", src),

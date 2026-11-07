@@ -1523,3 +1523,58 @@ CPU 时间不受调度延迟与 page cache 影响，是同一口径的量：
 **方法论结论**：判断「某个缓存/预编译优化是否生效」这类问题，
 **wall clock 在嘈杂设备上不可用，应直接看 CPU profile 的分项**。
 wall clock 可以顺带记，但结论必须建立在 CPU 时间上。
+
+### 6.17 容器内设备能力（AgentBridge）端到端
+
+Linux 模式相对 tawcroot 的核心差异之一：容器里的 agent 能直接操作这台手机。
+链路跨三个域，任何一环断掉都只表现为「工具报 403/超时」：
+
+    容器（musl）→ 宿主回环 TCP → App 的 AgentBridge → Android 无障碍服务
+
+验证脚本 `bench/bridge_probe.sh`（在容器内跑），四段断言：
+
+| 断言 | 含义 | 期望 |
+|---|---|---|
+| `no_token_403` | 无 token 必须被拒 | 证明鉴权真的在起作用，不是裸奔 |
+| `auth_ok` | 带 token 可达 | 证明 token 注入链路通 |
+| `a11y_ok` | 无障碍服务可用 | 拿得到前台包名 |
+| `launch_ok` | 真能操作设备 | 启动 app 并核对回执包名 |
+
+模拟器 dsh34 / x86_64 / Alpine 3.22.2 实测：
+
+```
+no_token_403=ok
+auth_ok=ok
+a11y_ok=ok
+launch_ok=ok
+RESULT: BRIDGE_OK
+```
+
+反向验证：把 token 换成错误值或清空，后三项立刻 FAIL（`no_token_403`
+仍 ok —— 它本来就该在无 token 时通过）。宿主侧用 `dumpsys window` 核对，
+`mFocusedApp` 确实切到 `com.android.settings`。
+
+**前提两条**（都是容易被忽略的）：
+
+1. **App 进程必须在跑** —— bridge 是 App 内的 HTTP 服务（:3083），
+   App 被杀则整条链路消失。判据 `pidof app.dsh.mobile`。
+2. **token 是每进程随机生成的** —— 只在引擎子进程的 environ 里，
+   不在任何 prefs 或日志中（`currentToken()` 不打日志值）。取法：
+   `for p in $(ps -A -o PID,NAME | grep node); do cat /proc/$p/environ |
+   tr '\0' '\n' | grep DSH_BRIDGE_TOKEN; done`。空 token **不写**进环境，
+   否则 `_dsh_http.sh` 的 `[ -n "$TOKEN" ]` 会通过、反而发出无头请求。
+
+**门脚本在容器里的自举链**（这条不通则 `scr`/`notify`/`say` 全部
+`not found`，很容易误判成脚本丢了）：
+
+    assets/gates/scr 的 shebang #!/system/bin/sh
+      → 容器 rootfs 无 /system/bin（需 installLinuxCompatShims 补 shim）
+      → 脚本内 exec "@DSH_BASH@"，Linux 模式替换为 /bin/bash
+      → Alpine 的 /bin/bash 来自 BOOTSTRAP_PACKAGES（bash/curl/ca-certificates）
+      → 缺 bash 时报 "exec: line 8: /bin/bash: not found"
+
+装载顺序也容易踩：`-m /eng:<宿主engine目录>` 会让容器里看到的
+`/eng/bin/scr` **就是宿主那份**（shebang 写死 `/system/bin/sh` +
+bionic bash 绝对路径），在 musl 里必 `REEXEC: preload FAIL`。
+要验产线部署结果，必须用 `-m /eng:` 之外的路径，或先让
+`deployLinuxAgentGates()` 真正跑过一遍。

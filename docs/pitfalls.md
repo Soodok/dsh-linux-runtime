@@ -2430,3 +2430,72 @@ if (gr != 0 || (long)pc.uid != myuid) {
 
 加完校验必须重跑 fork+exec 五场景（pitfalls #63 的验收清单）——
 同 uid 的请求要照旧全部通过，否则等于把一个功能缺陷换成一个安全缺陷。
+
+## 65. cleaner 消息容量两端都是 8KB + 单次 IO → 环境被静默截断（2026-11-07）
+
+**症状**：bionic 程序拿到的环境变量比用户 `export` 的**短一截**，且没有任何提示。
+
+实测（模拟器 dsh34 / x86_64，用 `envdump` 打印 `environ`）：
+
+| 场景 | 收到 | ENVBYTES | ENVCOUNT |
+|---|---|---|---|
+| 对照（小环境） | — | 1937 | 18 |
+| 单变量 7000 字节 | `BIGVAR_LEN=7000` ✅ | 8945 | 19 |
+| 单变量 30000 字节 | **`BIGVAR_LEN=7043`** ❌ | **8130**（≈8191） | **12**（丢 7 个） |
+
+30000 字节的变量只到了 7043，另外 7 个变量整个不见。npm/pip/构建脚本
+读到被砍掉尾巴的配置值却毫无提示 —— 与 #63 的「短写」是同一类病：
+**容量边界处必须报错，不能悄悄截断。**
+
+**为什么只修一端没用**
+
+这条链上**两端**都是「8KB 定长缓冲 + 单次 IO」：
+
+- 发送端 `cleaner_exec` 的 `static char msg[8192]`（拼 path + argv + env）
+- 接收端 `cleaner_loop` 的 `static char buf[8192]` + 单次 `read`
+
+我先只把发送端放大到 64KB，重测**症状一模一样**（还是 7043 / 8130）——
+因为接收端还是 8KB。**只改一端，症状完全不变，极易误判成「没生效」。**
+
+**修法三件（缺一不可）**
+
+1. 两端缓冲都放大到 **64KB**（与 #63 的 `find_cleaner_by_prefix` 一致）。
+2. 接收端**循环读到协议结束**，不能假设一次 `read` 拿全。协议形态是
+   `path\0argv[1..]\0\0ENV[1..]\0\0`，判据是「连续两个 NUL 且最后读到的
+   字节是 NUL」。
+3. 发送端装不下时**显式失败**，并且**让用户看到真正的原因**：
+
+```c
+if (trunc) {
+    ldr_puts("dsh: cannot run bionic program: argv+env exceeds 64KB (");
+    ldr_log1("", n, 10);
+    ldr_puts(" bytes) — refusing to silently truncate environment");
+    raw6(SYS_close, fd, 0, 0, 0, 0, 0);
+    return -1;
+}
+```
+
+第 3 条的第 2 半句很关键：只 `return -1` 的话，调用点会打印通用的
+`BIONIC: cleaner_exec FAIL` 并把 errno 设成 `ENOENT`，用户看到的是
+`sh: /prog: not found` —— 与实际原因（环境太大）毫无关系，
+排查会往「路径写错了」跑。上一轮 #57 就是同一个教训（`bootstrap failed:`
+后面空白，把我引向「镜像站挂了」）。
+
+**实测修后**：30000 字节变量 → `BIGVAR_LEN=30000`、ENVBYTES 31945、
+ENVCOUNT 19；100KB → 用户可见
+`dsh: cannot run bionic program: argv+env exceeds 64KB (65534 bytes)`。
+
+**附带踩到的坑：往 C 源码里写入了真实 NUL 字节**
+
+我用 Python 往注释里写协议说明 `path\0argv`，`\0` 被当成真 NUL 写进文件
+（一次 7 个）。后果非常隐蔽：
+
+- `file` 报 `C source`（所以人眼看不出异常）
+- **`grep` 把文件当二进制，直接跳过且不报错** —— `grep -c "static char buf[65536]"`
+  返回 0，我以为改动没生效
+- `sed -i` 对它做替换也**静默不生效**，于是「反向验证」根本没改到代码，
+  测出来还是正确结果，差点得出「反向验证无效」的错误结论
+
+修法：`python` 里用 `data.replace(b"\x00", b"\0")` 把真 NUL 换回字面反斜杠 0。
+**教训：改 C 源码里的 `\0` 文本时，一律用 raw 字符串或双反斜杠；
+改完用 `file` + `raw.count(b"\x00") == 0` 验一遍。** 探针里已加这条断言（E1）。

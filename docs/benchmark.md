@@ -1857,3 +1857,62 @@ boot step health-poll:      2782ms  (total 3096ms)
 **可复现脚本**：`bench/qemu_boot.sh <rootfs> <runner> serial|screen`
 - `serial` 模式约 40s，输出 `RESULT: QEMU_SERIAL_OK`
 - `screen` 模式约 80s，输出 `RESULT: QEMU_SCREEN_OK size=16777216`
+
+### 6.21 QEMU 虚拟机的持续帧服务与输入注入（10fps 实测通）
+
+**单帧成本（批平均，已去掉人工 sleep）**
+
+| 方式 | 单帧 | 体积 | 结论 |
+|---|---|---|---|
+| `screendump` → PPM | **9.0 ms/帧（111fps）** | 3072016 B（1280×800 P6） | ✅ 选它 |
+| `pmemsave` 0xfd000000 | 31.0 ms/帧 | 16777216 B（固定 16MB） | 慢 3.4×、大 5× |
+| shell 每帧调 `nc` | 207 ms/帧 | — | 慢 23×，不可用于持续服务 |
+
+**qscreensrv 设计要点（`bench/qscreensrv.c`）**
+
+1. **单进程一条 monitor 长连接到底** —— shell 每帧起 `nc` 要 207ms/帧，
+   是进程启动开销而非 QEMU 慢。
+2. **monitor 断了自动重连，不退出** —— 持续服务不能因单次失败判死
+   （同 pitfalls #60 的教训）。
+3. **alpha 显式置 255，绝不抄源字节** —— PPM 只有 RGB，但若将来换 XRGB
+   来源，第 4 字节不是 alpha，抄过去 App 侧 `ARGB_8888` 会当真读，
+   整屏变全透明且不报错。
+4. **seq 最后写** —— 它是宿主判「有没有新帧」的唯一依据，先写会导致读到
+   半帧像素。
+5. 共享文件格式与 `lib/dsh_gl.h` 完全一致，App 侧 `LinuxFrameSurface.kt`
+   直接复用，无需改动。
+
+**实测输出**
+
+```
+MONITOR_OK 127.0.0.1:4470
+CAPTURE 1280x800 ppm=3072016B
+RESULT: QSCREENSRV_STARTED
+共享文件 magic=0x4D415246 seq=247 w=1280 h=800 bytes=4096016
+```
+
+`4096016 = 16 + 1280×800×4` ✓。非零像素 37666，**alpha≠255 的像素 0 个**。
+解成 PNG 后可读看到 guest 的 fbcon 全屏内容（内核日志、`/proc/fb`、
+`/dev/fb0` 设备节点行全部清晰）。
+
+**输入注入验证（像素级）**
+
+QEMU monitor 的 `sendkey` / `mouse_move` / `mouse_button` 直通。
+
+判据**不能是「命令返回 OK」** —— 那只能证明 monitor 收下了命令。
+唯一可信判据是注入前后各抓一帧、比像素：
+
+```
+注入 h e l l o 前后：
+  不同像素数: 174
+  变化区域:   x 0..47   y 594..607     ← 正好一个字符格宽度
+  变化颜色:   aaaaaa(158) + 000000(16)
+```
+
+`#AAAAAA` 是 fbcon 默认前景色、`#000000` 是背景 —— 说明屏幕真的多出了
+6 个字符格的字形，不是光标闪烁（光标只有 1 格）。
+
+**PNG 导出的一个坑**（不是 QEMU 的问题但踩了）
+共享文件是 RGBA（4 字节/像素），写 PNG 时 `color type` 必须用 **6**（RGBA）。
+用 2（RGB）会得到「Unsupported or malformed image data」，两个看图器都打不开，
+而 PNG 结构与 CRC 全都合法 —— **又一次「结构正确 ≠ 内容正确」**。

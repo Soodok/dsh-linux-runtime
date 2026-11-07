@@ -1961,6 +1961,99 @@ I EngineSupervisor: spawning engine in LINUX container:
 但 rootfs 解包由 App 自己做，本来就在 App 进程里。所以真正可疑的是
 「谁把它改成了 root 属主/无 MCS」，见 pitfalls #56。
 
+## #61 bionic 直通在自我重执行后失效 —— 产线上所有图形程序都跑不了（30 轮未发现）
+
+### 症状
+
+容器里跑任何 bionic 二进制（NDK 编的、要吃 Adreno 的图形程序）都是：
+
+```
+BIONIC: cleaner_exec FAIL
+sh: /framesrv: not found          (rc=127)
+```
+
+而 `apk`、`sh`、`gcc`、`node` 这些 musl 程序全部正常 —— 看起来像
+「路径写错了」或「文件不存在」，实际文件在、权限对、ELF 也正常。
+
+### 为什么 30 多轮没被发现
+
+直接调用走的是**首次装载**：
+
+```sh
+dsh_alpine <rootfs> <interp> /gpu_probe      # ← 能跑通
+```
+
+此时 `g_cleaner_on` 还在同一进程里，bug 完全掩盖自己。只有经 `sh -c` 的
+**容器内二次 execve**（这就是产线路径）才暴露：
+
+```sh
+dsh_alpine <rootfs> <interp> /bin/sh -c '/framesrv ...'   # ← 必失败
+```
+
+之前所有「容器内 GPU 已验证」的结论都来自第一种调用方式，所以一直
+没触到这条。
+
+### 根因（两层）
+
+loader 的 bionic 直通依赖一个在 `install_filter()` **之前** fork 的
+filter-free 子进程（cleaner）。父进程随后 `execveat(/proc/self/exe)`
+自我重执行，`.data` 段被重初始化 → 三个全局全归零：
+
+```c
+g_cleaner_on = 0;      g_cleaner_pid = 0;      g_cleaner_namelen = 0;
+```
+
+原设计靠环境标记 `DSH_CLEANER=1` 恢复，但：
+
+1. **标记传不到**：它被写进 `g_env_store`（最终交给 guest 的那份），
+   而重执行那行 `execveat` 传的是 `genvp`（调用方原始 envp）——
+   两块内存不同，标记永远到不了新 loader。我改了两版都还是失败。
+2. **即便传到了也没用**：`cleaner_exec()` 开头是
+
+   ```c
+   if (!g_cleaner_on || g_cleaner_pid <= 0) return -1;
+   ```
+
+   `g_cleaner_pid` 也是 0。只恢复 `g_cleaner_on` 仍然直接 return -1。
+   **这一条我改了四轮才看出来** —— 前几轮都在修「标记为什么传不下去」。
+
+### 修法
+
+不依赖环境变量。socket 名 = `<prefix><uid>_<pid>`，而 **uid 与 pid 跨
+exec 都不变**。重执行后重新算一遍名字、`connect` 一次探活即可。探活
+成功时三件状态**一起**恢复：
+
+```c
+int plen = cleaner_sockname(pname);        /* 重新算 */
+... connect(pfd, psa, palen) == 0 →
+    g_cleaner_on = 1;
+    g_cleaner_pid = 1;                     /* 哨兵：靠 socket 通信，不靠 wait4 */
+    g_cleaner_namelen = plen;
+    g_cleaner_addrlen = palen;
+```
+
+`g_cleaner_pid = 1` 是安全的：`cleaner_exec()` 只把它当「非 0」判断，
+真正的等待走 socket 读回执，不 `wait4(g_cleaner_pid)`。
+
+### 修复后实测（模拟器 dsh34 / x86_64）
+
+```sh
+$ dsh_alpine <rootfs> /lib/ld-musl-x86_64.so.1 /bin/sh -c '/framesrv 320 180 0 3 <share> clear rpix'
+DSH_FRAME pid=7891 w=320 h=180 fmt=rgba8888 hdr=16
+  renderer=Android Emulator OpenGL ES Translator (AMD Radeon RX 5700 XT)
+progress frames=120 63.8 fps
+progress frames=240 62.5 fps
+...
+```
+
+**容器内拿到真实 GPU，稳定 60+ fps。** 这条修好之前，产线上任何 bionic
+程序（含所有走 GL 的）都是 rc=127。
+
+### 教训
+
+「两条调用路径」必须都验：首次装载 ≠ 容器内二次 execve。前者能过不代表
+后者能过 —— 而用户永远走后者。
+
 ## #59 `pkill -f <pattern>` 会匹配到运行它的 shell 自己 —— 把自己杀掉
 
 清残留进程时写 `pkill -f 'wlshot .* --loop'`，看起来没问题，实测：

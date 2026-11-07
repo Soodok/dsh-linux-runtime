@@ -2360,3 +2360,73 @@ sh -c 'export MYTEST=deep; /bin/sh -c "/eprobe"'   # 5 嵌套 env 透传
 第 5 条尤其重要：我曾为绕开「消息过长」把环境改成白名单转发
 （只留 LD_*/PATH/HOME/TMPDIR/LANG），结果用户 `export` 的变量全部丢失
 —— 那是比原缺陷更严重的行为回归。**真正该修的是写入端短写，不是砍内容。**
+
+## 64. cleaner 的抽象 socket 跨 uid 无保护 → 同机任意进程可借它提权（2026-11-07）
+
+**先说结论**：抽象命名空间（`sun_path[0]==0`）的 AF_UNIX socket
+**没有任何权限检查**。谁把名字拼出来，谁就能连上去。
+
+**实测（本机 dsh34 / Android 14 / x86_64）**
+
+```
+[A] uid=0 绑定 @dsh-cleaner-77777_deadbeef 并 listen
+[SERVE uid=0 alen=29]
+[同 uid=0 connect]      CONNECT uid=0     rc=0
+[跨 uid 10811 connect]  CONNECT uid=10811 rc=0      <- 连上了
+[跨 uid 10810 connect]  CONNECT uid=10810 rc=0      <- 连上了
+```
+
+文件系统 socket 靠目录权限挡人，抽象 socket 连这道都没有。
+
+**危害链**
+
+`cleaner_exec()` 拿到对端发来的 `path\0argv\0\0env\0\0` 后，是用
+**cleaner 自己的权限** `fork+execve`。cleaner 跑在 App 的 uid 下 ——
+于是同机任意低权限进程都能让它以 App 权限执行任意程序。
+
+**渗透实测（可复现）**
+
+攻击端用 uid 10810 连上 root 域的 cleaner，发一条
+`/system/bin/sh -c "touch /data/data/<pkg>/files/PWNED_BY_UID10810"`：
+
+| 版本 | 结果 |
+|---|---|
+| 加校验前 | `RESP r=1 st=0` → **`VULNERABLE`**（标记文件被创建） |
+| 加校验后 | `RESP r=-1` → **`BLOCKED`**（标记文件不存在） |
+
+**为什么这道防线本来「看起来」存在**
+
+socket 名是 `<prefix><uid>_<pid>`，`cleaner_exec` 原本按**自己 uid 段**
+精确匹配 —— 名字本身挡住了跨 uid。但 **fork+exec 场景必须放宽成前缀匹配**
+（子进程 pid 变了猜不中，只能扫 `/proc/net/unix`，见 pitfalls #63），
+一旦放宽，名字就不再是护栏。**放宽名字匹配的同时必须补真正的凭据校验。**
+
+**修法（`cleaner_loop` 里，accept 之后、read 之前）**
+
+```c
+struct peer_ucred { int pid; unsigned int uid; unsigned int gid; } pc;
+unsigned int pclen = (unsigned int)sizeof(pc);
+long gr = raw6(SYS_getsockopt, cfd, 1 /*SOL_SOCKET*/, 17 /*SO_PEERCRED*/,
+               (long)&pc, (long)&pclen, 0);
+long myuid = raw6(SYS_getuid, 0, 0, 0, 0, 0, 0);
+if (gr != 0 || (long)pc.uid != myuid) {
+    raw6(SYS_close, cfd, 0, 0, 0, 0, 0);
+    continue;          // 回 accept，不退出 cleaner、不回任何数据
+}
+```
+
+三个细节都不能省：
+- **`gr != 0` 也要拒绝**。判据写成 `if (gr == 0 && pc.uid != myuid)` 就等于
+  「取不到凭据 → 放行」，比不校验更糟。
+- **必须 `continue`**。写成 `exit_group` 就是 #63 那个「一个探活能打死
+  常驻服务」的坑重现。
+- **不写日志**。cleaner 的 stdio 借自容器进程，往它写可能卡住（见 pitfalls #63
+  关于 `ldr_write` 写 fd 2 的说明）。
+
+`SYS_getsockopt` 编号：aarch64（asm-generic）**209**，x86_64 **55**；
+`SO_PEERCRED` = 17。用 NDK 头里的 `SYS_getsockopt` 宏，别硬编码。
+
+**回归要求（安全校验不能误伤自己人）**
+
+加完校验必须重跑 fork+exec 五场景（pitfalls #63 的验收清单）——
+同 uid 的请求要照旧全部通过，否则等于把一个功能缺陷换成一个安全缺陷。

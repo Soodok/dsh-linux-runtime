@@ -2565,3 +2565,83 @@ if (too_many) {
 **部署核对（本项第三次踩）**：改完必须比 md5。有一次 `cp` 到运行中的文件
 静默失败，设备上还是旧产物（`5789d41e` vs 本地产物 `19787cdd`），我据此
 差点得出「反向验证无效」的结论。**先 `rm -f` 再 `cp`，然后 `md5sum` 比对。**
+
+---
+
+# 第 47 条：MAP_FIXED_NOREPLACE 在老内核上被静默忽略
+
+## 症状（极具误导性）
+
+容器里 shell 的内建命令全部正常，但**跑任何外部命令都没有任何输出**：
+
+```sh
+/bin/busybox sh -c 'echo A'                      # A          ← 内建，OK
+/bin/busybox sh -c 'cat /etc/alpine-release'     # （空）rc=131
+/bin/busybox sh -c 'ls /'                        # （空）rc=131
+```
+
+`rc=131` 是 `exit_group(131)`，来自 loader 里「interp 段文件映射失败」那一支。
+用宿主 strace 抓到的决定性三行：
+
+```
+mmap(0x7000000000, 679936, PROT_READ|PROT_WRITE,
+     MAP_PRIVATE|MAP_ANONYMOUS|0x100000, -1, 0) = 0x7e66ba588000   ← 不是请求的地址
+pread64(4, 0x70000a1aa0, 2404, 658080) = -1 EFAULT (Bad address)
++++ exited with 131 +++
+```
+
+## 根因
+
+`0x100000` = `MAP_FIXED_NOREPLACE`，**Linux 4.17 才引入**。
+
+- Android 真机（8/9 代以后）通常 ≥4.4，很多机型已经 ≥5.4，不会遇到
+- **Android 模拟器镜像的内核长期停在 3.18 / 3.10**（实测 emulator-5554 是 3.18.91）
+- 老内核不认识这个位 → 当作未知标志忽略 → 请求退化成普通 hint 型 mmap →
+  内核可以（也确实）返回别的地址
+
+而 loader 后续所有动作（PT_LOAD 的 MAP_FIXED、慢路径的 pread64）都按
+`IHI + ilo` 这个**绝对值**算地址，于是写进了没映射过的区域。
+
+## 修法
+
+**不要假设「传了 NOREPLACE 就一定落在请求地址」**，必须校验返回值：
+
+```c
+long want = (long)(IHI + ilo);
+long rv = raw6(SYS_mmap, want, ispan, 3, 0x22 | 0x100000, -1, 0);
+if (rv >= 0 && rv > -4096 && rv != want) {
+    raw6(SYS_munmap, rv, ispan, 0, 0, 0, 0);   /* 撤掉跑偏的那段 */
+    rv = -1;
+}
+if (rv < 0 && rv > -4096) {
+    rv = raw6(SYS_mmap, want, ispan, 3, 0x32 /*FIXED*/, -1, 0);
+}
+if (rv < 0 && rv > -4096) exit_group(123);
+if (rv != want) exit_group(123);               /* 最后再核一次 */
+```
+
+`interp` 段（注释里叫「整段预留 anon RW」）与 `guest` 段**两处都要改** ——
+这是同一个坑第二次出现。
+
+## 为什么必须优先修
+
+gcc / clang / make / cmake 全部依赖 fork+exec（拉 cc1、as、ld、子进程）。
+这条一断，容器里**任何编译都不可用**，而且失败方式是完全静默的 ——
+文件不生成、无报错、退出码 131 藏在 strace 里。
+
+## 验证方法
+
+一条命令即可判定「fork+exec 是否正常」：
+
+```sh
+$RUNNER $ROOTFS $INTERP /bin/busybox sh -c 'cat /etc/hostname && echo MULTI-OK'
+```
+
+`cat` 是外部命令，走 fork+exec；`echo` 可能是内建。**两者都过才算通。**
+
+## 相关
+
+- 同族问题：`execveat` 也要 Linux 3.19+。老内核上它返回 ENOSYS，
+  loader 会退回 fork 路径 —— 只要 fork 路径本身正确，功能不丢（只是慢）。
+- 排查顺序建议：先确认 `execveat` 是否可用（`uname -r` 判版本即可），
+  再用上面那条命令确认 fork 路径是否健康。

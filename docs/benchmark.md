@@ -1799,3 +1799,61 @@ boot step health-poll:      2782ms  (total 3096ms)
 **注意**：上面的 `engine/bin` 里的 flusher 探针路径在新版 runtime 里已变化
 （`node-compile-cache-flusher.cjs` 不在 engine 根了），所以外部 `--require`
 方式暂时失效，本轮的原生冷热复测未能完成。App 自身的 boot step 计时不受影响。
+
+### 6.20 手机上跑 QEMU 虚拟机并取到真实画面（主机侧取证完成）
+
+目标里「在手机里跑模拟器且能给出画面」这一项，链路打通并做到了**像素级取证**。
+
+**平台限制（实测，非推测）**
+
+| 项 | 实测值 | 含义 |
+|---|---|---|
+| `/dev/kvm` | 不存在 | 无硬件虚拟化 |
+| `grep -c vmx /proc/cpuinfo` | `0` | CPU 不暴露 VMX（模拟器宿主） |
+| 可用加速 | `-accel tcg` | 纯软件模拟，guest 引导 40s+ |
+
+**三段链路与各自耗时**
+
+| 阶段 | 现象 | 耗时 |
+|---|---|---|
+| QEMU 启动 + SeaBIOS | `Booting from ROM...` | ~2s |
+| guest 内核引导（TCG） | 内核日志开始滚动 | ~1.5s |
+| bochs DRM probe + fbcon 切模式 | `fb0` 出现、`160x50` 字符模式 | ~0.15s 内连续完成 |
+
+内核日志原文（Alpine `linux-lts` / `6.12.115-0-lts` / `-vga std`）：
+
+```
+[    1.653093] bochs-drm 0000:00:02.0: vgaarb: deactivate vga console
+[    1.659430] [drm] Found bochs VGA, ID 0xb0c5.
+[    1.659544] [drm] Framebuffer size 16384 kB @ 0xfd000000, mmio @ 0xfebf0000.
+[    1.663288] [drm] Found EDID data blob.
+[    1.670408] [drm] Initialized bochs-drm 1.0.0 for 0000:00:02.0 on minor 0
+[    1.687830] fbcon: bochs-drmdrmfb (fb0) is primary device
+```
+
+**取画面的三条路，只有一条可用**
+
+| 路径 | 结果 |
+|---|---|
+| `-display vnc=127.0.0.1:2` + 自写 RFB 客户端 | `desktop 0x0` → 只拿到 16 字节帧头 |
+| `-monitor stdio` + stdin 重定向 + `screendump` | 命令不执行（后台进程 stdin 重定向无效），文件永不生成 |
+| `-monitor tcp` + `pmemsave`（**相对路径**） | ✅ 16777216 字节完整 framebuffer |
+
+`pmemsave` 读的是 guest 物理地址 `0xfd000000`（bochs DRM 的 VRAM 基址），
+等于绕开 VNC 显示模式协商，直接取像素。
+
+**像素级验证**
+
+按 1280×800 / 32bpp 解析 16 MB 转 PNG，得到**可读的 fbcon 文本画面**：
+内核日志每一行都是清晰字形，前景 `#AAAAAA`（fbcon 默认色），背景纯黑。
+肉眼可读到 `[drm] Found bochs VGA` / `fbcon: ... (fb0) is primary device` 等行。
+
+**判据设计（关键）**
+
+「qemu 进程在跑」和「串口有日志」这两条在 `NO_DEV_FB` 时同样成立 ——
+本轮前面几轮就是这样误判「虚拟机起来了」。唯一可信判据是
+**解开 framebuffer 看到字形**。
+
+**可复现脚本**：`bench/qemu_boot.sh <rootfs> <runner> serial|screen`
+- `serial` 模式约 40s，输出 `RESULT: QEMU_SERIAL_OK`
+- `screen` 模式约 80s，输出 `RESULT: QEMU_SCREEN_OK size=16777216`

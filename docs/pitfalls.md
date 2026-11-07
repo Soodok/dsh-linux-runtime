@@ -2645,3 +2645,106 @@ $RUNNER $ROOTFS $INTERP /bin/busybox sh -c 'cat /etc/hostname && echo MULTI-OK'
   loader 会退回 fork 路径 —— 只要 fork 路径本身正确，功能不丢（只是慢）。
 - 排查顺序建议：先确认 `execveat` 是否可用（`uname -r` 判版本即可），
   再用上面那条命令确认 fork 路径是否健康。
+
+## #63 QEMU 在手机上跑不出画面 —— 三层独立缺失，每层症状都指向别处
+
+### 症状
+
+`qemu-system-x86_64` 能启动、串口日志正常滚完内核引导，但：
+
+- `-display vnc=...` 连上去报 `desktop 0x0 ""`，`rects=4` 但写出的帧只有 16 字节头
+- `-display gtk/sdl` 直接 `Could not initialize SDL/GTK`
+- guest 内 `ls /dev/fb*` → `NO_DEV_FB`；`cat /proc/fb` → 空
+
+三层现象看起来像三个不同的问题，实际是**同一条链上的三个独立缺失**。
+
+### 根因（逐层）
+
+**第一层：guest 内核没有可用的 DRM 驱动。**
+本机的 Alpine `linux-virt` 内核满足 `CONFIG_DRM=y`、`CONFIG_DRM_KMS_HELPER=y`、
+`CONFIG_DRM_SIMPLEDRM=y`，看起来「内置了显示驱动」。但
+`simpledrm` 只吃 **EFI GOP framebuffer**，而 SeaBIOS 不提供 EFI ——
+它 probe 时拿不到任何 framebuffer，安静地不注册。
+
+换 `linux-lts`（同为 `6.12.115-0`）后才有关键的 `CONFIG_DRM_BOCHS=m`。
+**但它是模块，`initramfs` 里没有就永远不会加载。**
+
+**第二层：bochs 模块的依赖链不全。**
+只放 `ttm` + `drm_ttm_helper` + `bochs` 三个 `.ko`，insmod `bochs` 报：
+
+```
+bochs: Unknown symbol drm_gem_vram_simple_display_pipe_cleanup_fb (err -2)
+bochs: Unknown symbol drm_gem_vram_driver_dumb_create (err -2)
+bochs: Unknown symbol drm_vram_helper_mode_valid (err -2)
+...
+insmod: can't insert '.../bochs.ko': unknown symbol in module
+```
+
+缺的是 **`drm_vram_helper.ko`**（提供 `drm_gem_vram_*` 一族）。
+完整顺序必须是：
+
+```
+ttm → drm_ttm_helper → drm_vram_helper → bochs
+```
+
+顺序反了同样是 `unknown symbol`（不是缺模块，是前一个还没加载）。
+
+**第三层：取画面的三条路都不通。**
+- `-monitor stdio` + stdin 重定向：在 `setsid`/`nohup` 起的后台进程里
+  **重定向不生效**，`pmemsave` 命令根本不执行 —— 文件永不生成，
+  且 `qemu*.log` 里连 QEMU 的应答都没有，看起来像 qemu 没起来。
+- HMP 的 `pmemsave 0xfd000000 0x1000000 /tmp/fb.raw` 报
+  `invalid char 't' in expression` —— **HMP 把路径里的 `/` 当除号解析**。
+- VNC 在 guest 尚未 `drmModeSetCrtc` 时 `width=height=0`，
+  我们按 `W*H*4+16` 分配缓冲，于是只写出 16 字节头。
+
+### 修法
+
+```sh
+# 1) 用 linux-lts（有关键的 CONFIG_DRM_BOCHS=m），不要 linux-virt
+# 2) initrd 里按依赖顺序放并 insmod 四个模块
+for m in ttm drm_ttm_helper drm_vram_helper bochs; do insmod /lib/modules/.../$m.ko; done
+# 3) 用 TCP monitor（不要 stdio）执行 pmemsave
+setsid $Q ... -monitor tcp:127.0.0.1:4448,server,nowait &
+printf 'pmemsave 0xfd000000 0x1000000 fb.raw\n' | busybox nc 127.0.0.1 4448
+```
+
+`pmemsave` 用**相对路径**（靠 QEMU 的 cwd 定位）：HMP 会把 `/` 当除号。
+
+放下 `bochs` 后内核日志出现：
+
+```
+[drm] Found bochs VGA, ID 0xb0c5.
+[drm] Framebuffer size 16384 kB @ 0xfd000000, mmio @ 0xfebf0000.
+[drm] Found EDID data blob.
+[drm] Initialized bochs-drm 1.0.0 for 0000:00:02.0 on minor 0
+fbcon: bochs-drmdrmfb (fb0) is primary device
+Console: switching to colour frame buffer device 160x50
+```
+
+### 验证（像素级，不是「进程活着」）
+
+`pmemsave` 出来的 16 MB 里，按 1280×800/32bpp 解析能还原出**完整的
+fbcon 文本画面**：内核日志每一行都是可读字形，前景 `#AAAAAA`（fbcon
+默认），背景纯黑。这说明从 guest DRM → framebuffer → 物理内存 → 宿主
+文件这条链路是真的通的。
+
+**判据不能是「qemu 进程在跑」或「串口有输出」** —— 那两样在 fb0 `NO_DEV`
+的情况下同样成立。必须解出图看字。
+
+### 教训
+
+- **「CONFIG_DRM=y 就该有 fb0」是错的**：驱动内置不等于能 probe 到设备。
+  `simpledrm` 要 EFI GOP，SeaBIOS 下必然失败，且**不报错**。
+- **模块依赖缺一个，报的是 `unknown symbol` 而不是 `module not found`** ——
+  容易误判成「版本不匹配」而去重编内核。
+- **`pkill -f qemu-system` 会杀掉调用它的脚本自己**（命令行里含该串），
+  表现为「脚本无输出」。按 PID 精确杀。
+- 手机无 `/dev/kvm`、`cpuinfo` 无 `vmx` → 只能 `-accel tcg`，纯软件模拟慢，
+  guest 引导到可用要 40 秒以上，轮询等待必须给足。
+
+### 相关
+
+- 脚本：`bench/qemu_boot.sh`（`serial` / `screen` 两种模式）
+- 同族：pitfalls #59（pkill 自杀）、#35（AF_UNIX 路径翻译，QEMU 的
+  `/tmp/ser.txt` 也依赖它）

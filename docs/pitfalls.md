@@ -1884,3 +1884,126 @@ node bin.js web --patch ... --port 19998 --no-open
   否则一次 −10% 会被误读成「优化有效」。本轮第 1 次测出 −10.4% 时我差点
   写成「容器比原生快」，第二轮 +14.2% 立刻推翻。
 
+## #55 rootfs 的 SELinux MCS 分类与 App 进程不匹配 → `File.exists()` 静默 false
+
+这条是**产品级故障**，症状极具欺骗性：用户在 App 里明确开启 Linux 模式，
+引擎却静默回退原生，UI 上只显示「兼容模式」四个字。
+
+日志原文（模拟器 dsh34，App 内实测）：
+
+```
+W EngineMode: linux mode requested but unavailable:
+  Linux environment broken: env missing or dangling (links not repaired)
+  — falling back to native
+```
+
+### 误导点
+
+`status()` 的第三条判据是「取一个真实存在的符号链接样本，看它能否解析」，
+Alpine 用 `usr/bin/env`。报错说它 missing or dangling，于是所有排查都往
+「链接坏了 / rootfs 没解好」方向走。
+
+实测 root 视角下那个链接完全正常：
+
+```sh
+$ readlink usr/bin/env        → ../../bin/busybox
+$ [ -e usr/bin/env ]          → EXISTS
+$ ls -la bin/busybox          → 808712 B，在
+```
+
+即使把 `usr/bin/env` 手工换成断链、再换回来，App 报的还是同一句话 ——
+说明**判据本身没骗人，是 App 进程看不到**。
+
+### 真根因：SELinux MCS 分类不一致
+
+```
+app 进程  : u:r:untrusted_app_27:s0:c206,c256,c512,c768
+engine.log: u:object_r:app_data_file:s0:c206,c256,c512,c768   ← App 自己创建的
+rootfs 下 : u:object_r:app_data_file:s0                        ← 没有 MCS 分类
+```
+
+`ls -Z` 一对比就看出来了。App 自己的目录走的是
+`u:object_r:app_data_file:s0:c206,c256,c512,c768`，而 rootfs 是 root/su
+创建的，只有 `u:object_r:app_data_file:s0`。MCS 分类不同 → 访问被拒 →
+`java.io.File.exists()` 返回 false（**不抛 SecurityException**）→
+`status()` 判 BROKEN → 回退原生。
+
+### 修法
+
+```sh
+adb shell "chcon -R  u:object_r:app_data_file:s0:c206,c256,c512,c768 <rootfs>"
+adb shell "chcon -h -R u:object_r:app_data_file:s0:c206,c256,c512,c768 <rootfs>"
+```
+
+**两次都要跑，第二次带 `-h`**：`chcon -R` 默认不跟随符号链接，
+638 个 applet 链接会全部漏掉。只跑第一次时 `usr/bin/env` 仍是旧上下文，
+判据照旧失败 —— 这一步很容易漏，漏了两轮才发现。
+
+修完立刻见效：
+
+```
+I EngineSupervisor: spawning engine in LINUX container:
+  .../dsh_alpine -m /eng:... -m /ws:... -m /dsh:...
+  -m /storage/emulated/0:... -m /data/user:... -m /data/data:...
+  .../alpine /lib/ld-musl-x86_64.so.1 /usr/bin
+```
+
+即 Linux 模式**真的启动了**（此前 28 轮里它一次都没在 App 内起来过）。
+
+### 必须修的是 App 自己，不是让用户跑 chcon
+
+`chcon` 只是验证手段。用户不可能执行它，而且下次重装 App / 重建 rootfs
+还会复发。正确修法是在 App 侧：部署完 rootfs 后（或 `ensureDeployed` 末尾）
+按当前进程的 MCS 分类 `restorecon` 一遍，或直接在 App 进程里创建/重写这些
+文件（App 创建的文件天然带对的分类）。
+
+注意 `restorecon` 需要 root；免 root 的做法是**别让 root 建这些文件**——
+但 rootfs 解包由 App 自己做，本来就在 App 进程里。所以真正可疑的是
+「谁把它改成了 root 属主/无 MCS」，见 pitfalls #56。
+
+## #56 在 root 域跑过容器后，rootfs 的属主与 MCS 上下文会被改写
+
+`chcon` 修复验证时观察到：rootfs 里 **4861 个文件属主是 `root:root`**，
+而同目录另一些是 `u0_a206`。
+
+**归因要说清楚：这是我的测试污染，不是产品缺陷。**
+
+前几轮我用 `adb root` + root 域直接跑容器做图形栈/冷启实验，那时容器进程
+以 root 身份运行，`apk add bash`、sway 写的日志、`tmp/dsh-spill-*`、
+重解包的 `lib/ld-musl-*` 全都是 root 属主 + 不带 MCS 分类。
+实测统计：
+
+```sh
+$ find <rootfs> -user root | wc -l
+4861
+$ find <rootfs> -user root | head -5
+  tmp/dsh-spill-AhoApF        ← 容器跑的临时文件
+  tmp/sway.log tmp/wlwin.log  ← 我起 compositor 时写的
+  bin/bash                    ← 我 root 域 apk add 装的
+  lib/ld-musl-x86_64.so.1     ← 重解包覆盖的
+```
+
+**教训（对以后调试很重要）**：在 root 域直接操作 App 的私有目录，会把
+文件属主和 SELinux 上下文改成 root 的，之后 App 自己就访问不了了 ——
+而症状是 `File.exists()` 静默 false，不报"权限不足"。所以**验证完必须
+恢复**：
+
+```sh
+adb shell "chown -R 10206:10206 <rootfs>"
+adb shell "chcon -R  u:object_r:app_data_file:s0:<app MCS> <rootfs>"
+adb shell "chcon -h -R u:object_r:app_data_file:s0:<app MCS> <rootfs>"   # 别漏 -h
+```
+
+更稳的做法：**在 App 进程内做容器实验**（走 `run-as`），或另建一份
+独立 rootfs 给 root 域用，不要共用 `files/linux/distros/alpine`。
+
+**验证清单**（以后再遇到「Linux 模式起不来」先查这三项）：
+
+```sh
+adb shell "ls -Zd <rootfs> | head -1"          # MCS 分类是否有 c206,c256,c512,c768
+adb shell "ls -la <rootfs>/bin/bash"           # 属主是 u0_a206 还是 root
+adb shell "ls -Z <rootfs>/usr/bin/env <rootfs>/usr/bin | head -2"  # 链接本身 vs 目标
+```
+
+三项任一不对，App 侧的 `File.exists()` 就会静默 false。
+

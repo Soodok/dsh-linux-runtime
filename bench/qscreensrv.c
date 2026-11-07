@@ -82,16 +82,18 @@ static int drain_until_prompt(int fd) {
     }
 }
 
-static unsigned u32le(const unsigned char *p) {
-    return (unsigned)p[0] | ((unsigned)p[1] << 8) |
-           ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
-}
 static void put32(unsigned char *p, unsigned v) {
     p[0] = (unsigned char)v;         p[1] = (unsigned char)(v >> 8);
     p[2] = (unsigned char)(v >> 16); p[3] = (unsigned char)(v >> 24);
 }
 
-/* 读 PPM(P6) 头部，拿到宽高与像素起点偏移 */
+/* 读 PPM(P6) 头部，拿到宽高与像素起点偏移
+ *
+ * ★踩过：maxval 读完后**无条件只跳 1 字节**是错的。若 raster 前是 `\r\n`
+ *   （合法且常见），会只跳过 `\r`，把 `\n` 留在像素数据开头 → 整帧 RGB
+ *   错位 1 字节，表现为色偏/撕裂，且**完全不报错**。
+ *   必须按「一个空白分隔符」处理：`\r\n` 算一个，其它单字节算一个。
+ */
 static int ppm_header(const unsigned char *b, size_t len,
                       unsigned *w, unsigned *h, size_t *off) {
     size_t i = 0;
@@ -100,19 +102,26 @@ static int ppm_header(const unsigned char *b, size_t len,
     if (len < 2 || b[0] != 'P' || b[1] != '6') return -1;
     i = 2;
     while (i < len && field < 3) {
-        /* 跳过空白与注释 */
+        /* 字段之间允许任意空白与注释 */
         while (i < len && (b[i] == ' ' || b[i] == '\n' || b[i] == '\r' || b[i] == '\t')) i++;
         if (i < len && b[i] == '#') { while (i < len && b[i] != '\n') i++; continue; }
         unsigned v = 0;
         int got = 0;
-        while (i < len && b[i] >= '0' && b[i] <= '9') { v = v * 10 + (unsigned)(b[i] - '0'); i++; got = 1; }
+        while (i < len && b[i] >= '0' && b[i] <= '9') {
+            /* 防溢出：PPM 的宽高/最大值都在 32 位内，超了就是坏文件 */
+            if (v > 100000000u) return -1;
+            v = v * 10 + (unsigned)(b[i] - '0'); i++; got = 1;
+        }
         if (!got) return -1;
         vals[field++] = v;
     }
     if (field < 3) return -1;
-    /* 头部后必须恰好一个空白字符 */
+    /* P6 的 maxval 必须 ≤255 —— 否则像素是 2 字节/通道，按 3 字节解析必错 */
+    if (vals[2] == 0 || vals[2] > 255) return -1;
+    /* maxval 与 raster 之间**恰好一个**空白分隔符；\r\n 视为一个 */
     if (i >= len) return -1;
-    i++;
+    if (b[i] == '\r' && i + 1 < len && b[i + 1] == '\n') i += 2;
+    else i += 1;
     *w = vals[0]; *h = vals[1];
     *off = i;
     return 0;
@@ -126,13 +135,22 @@ int main(int argc, char **argv) {
     const char *share = argv[1];
     const char *host  = argv[2];
     int port = atoi(argv[3]);
-    int fps = (argc > 4) ? atoi(argv[4]) : 10;
-    if (fps < 1) fps = 1;
-    if (fps > 30) fps = 30;
+    /* ★踩过：原实现把 argv[4] 无条件 atoi 当 fps，
+     *   `qscreensrv <share> <host> <port> --input-stdin` 会得到 fps=1，
+     *   静默变成 1fps（用户以为只是开了输入）。必须按首字符区分数字与标志。 */
+    int fps = 10;
     int do_input = 0;
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--input-stdin") == 0) do_input = 1;
+        if (strcmp(argv[i], "--input-stdin") == 0) { do_input = 1; continue; }
+        if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+            int v = atoi(argv[i]);
+            if (v > 0) fps = v;
+            continue;
+        }
+        sayf("WARN unknown arg: %s\n", argv[i]);
     }
+    if (fps < 1) fps = 1;
+    if (fps > 30) fps = 30;
 
     int mon = tcp_connect(host, port);
     if (mon < 0) { sayf("FAIL connect monitor %s:%d errno=%d\n", host, port, errno); return 1; }
@@ -182,18 +200,28 @@ int main(int argc, char **argv) {
     unsigned frames_since = 0;
 
     for (;;) {
-        struct timespec t0, t1;
+        struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
 
         write(mon, "screendump " PPM_TMP "\n", strlen("screendump " PPM_TMP "\n"));
         if (drain_until_prompt(mon) != 0) {
-            /* monitor 断了 —— 重连，不退出（持续服务不能用单次失败判死） */
+            /* monitor 断了 —— 重连，不退出（持续服务不能用单次失败判死）
+             * ★踩过：connect 成功但 drain banner 失败时必须 close 再重试，
+             *   否则旧 fd 泄漏，且后续会把 banner 当命令回执 → 协议失步，
+             *   表现为随机超时 / 误判 monitor lost（静默降质）。 */
             say("WARN monitor lost, reconnecting\n");
             close(mon);
+            mon = -1;
             for (int i = 0; i < 30; i++) {
                 sleep(1);
-                mon = tcp_connect(host, port);
-                if (mon >= 0) { drain_until_prompt(mon); say("MONITOR_RECONNECTED\n"); break; }
+                int fd2 = tcp_connect(host, port);
+                if (fd2 < 0) continue;
+                if (drain_until_prompt(fd2) == 0) {
+                    mon = fd2;
+                    say("MONITOR_RECONNECTED\n");
+                    break;
+                }
+                close(fd2);   /* 连上了但没拿到提示符 —— 丢弃重试 */
             }
             if (mon < 0) { say("FAIL reconnect give up\n"); break; }
             continue;
@@ -204,11 +232,43 @@ int main(int argc, char **argv) {
         struct stat st2;
         fstat(f2, &st2);
         size_t n2 = (size_t)st2.st_size;
-        if (n2 <= poff) { close(f2); usleep(50000); continue; }
+        if (n2 == 0) { close(f2); usleep(50000); continue; }
         unsigned char *b2 = (unsigned char *)malloc(n2);
         if (!b2) { close(f2); break; }
         if (read(f2, b2, n2) != (ssize_t)n2) { free(b2); close(f2); continue; }
         close(f2);
+
+        /* ★每帧都要重解析头 —— guest 可能换分辨率（mode set / 启动图形栈）。
+         *   只用首帧的 W/H/poff 会在换模式后静默产出错位或截断的帧，
+         *   共享文件头还继续宣称旧尺寸，App 侧完全看不出来。 */
+        unsigned w2 = 0, h2 = 0;
+        size_t poff2 = 0;
+        if (ppm_header(b2, n2, &w2, &h2, &poff2) != 0) {
+            free(b2);
+            say("WARN ppm header bad, skip frame\n");
+            usleep(50000);
+            continue;
+        }
+        if (w2 != W || h2 != H || poff2 != poff) {
+            /* 尺寸或头长度变了 → 重建共享文件，否则像素区按旧步长解释必错 */
+            sayf("REBUILD resolution %ux%u -> %ux%u\n", W, H, w2, h2);
+            munmap(map, total);
+            close(fd);
+            W = w2; H = h2; poff = poff2;
+            pixbytes = (size_t)W * H * 4;
+            total = HDR + pixbytes;
+            fd = open(share, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) { sayf("FAIL reopen share errno=%d\n", errno); free(b2); return 1; }
+            if (ftruncate(fd, (off_t)total) != 0) { sayf("FAIL retrunc errno=%d\n", errno); free(b2); return 1; }
+            map = (unsigned char *)mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (map == MAP_FAILED) { sayf("FAIL remmap errno=%d\n", errno); free(b2); return 1; }
+            pix = map + HDR;
+            put32(map + 0, MAGIC);
+            put32(map + 8, W);
+            put32(map + 12, H);
+            /* seq 保持单调递增，不能归零（宿主靠它判新帧，归零会当成旧帧丢弃） */
+            put32(map + 4, seq);
+        }
 
         /* PPM 是 RGB 三元组；共享文件要 RGBA，alpha 必须显式置 255。
            ★这条踩过：XRGB8888 的第 4 字节不是 alpha，抄过去会让 App 全透明。 */
@@ -240,8 +300,7 @@ int main(int argc, char **argv) {
 
         struct timespec t2;
         clock_gettime(CLOCK_MONOTONIC, &t2);
-        long used = (t2.tv_sec - t1.tv_sec) * 0 +   /* 未用 t1，占位保持结构一致 */
-                    (t2.tv_sec - t0.tv_sec) * 1000L +
+        long used = (t2.tv_sec - t0.tv_sec) * 1000L +
                     (t2.tv_nsec - t0.tv_nsec) / 1000000L;
         long wait = frame_ms - used;
         if (wait > 0) usleep((useconds_t)(wait * 1000));

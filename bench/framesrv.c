@@ -253,6 +253,7 @@ int main(int argc, char **argv) {
      *   而帧服务是产线依赖的，退化成 rpix 只是慢一点，完全不能崩。
      */
     int use_ahb = 0;
+    int ahb_fail_streak = 0;   /* AHB lock 连续失败计数，达 3 次彻底切 rpix */
     void *ahb = 0;
     AHBDesc ahbreal;
     memset(&ahbreal, 0, sizeof ahbreal);
@@ -348,7 +349,8 @@ int main(int argc, char **argv) {
              * 高效（实测 3.954 vs 8.379 ms @1080p），所以整体仍快 1.72 倍。
              * stride 可能 > W*4（对齐），必须按行拷。 */
             void *addr = 0;
-            if (ahb_lock(ahb, 0x2 /*CPU_READ_OFTEN*/, -1, (const void *)0, &addr) == 0 && addr) {
+            int lock_rc = ahb_lock(ahb, 0x2 /*CPU_READ_OFTEN*/, -1, (const void *)0, &addr);
+            if (lock_rc == 0 && addr) {
                 unsigned st = ahbreal.stride ? ahbreal.stride : (unsigned)(W * 4);
                 unsigned char *src = (unsigned char *)addr;
                 if (st == (unsigned)(W * 4)) {
@@ -359,6 +361,30 @@ int main(int argc, char **argv) {
                                src + (size_t)y * st, (size_t)W * 4);
                 }
                 ahb_unlock(ahb, 0);
+                ahb_fail_streak = 0;
+            } else {
+                /* ★AHB lock 失败必须退回 glReadPixels，不能什么都不做。
+                 *
+                 * 原来的实现：lock 失败时整个 if 块被跳过，pixels 保持**上一帧**
+                 * 的内容，但下面 write_hdr 照旧把 seq 加一。宿主侧判据是 seq
+                 * 变化 → 认为有新帧 → 显示旧内容。画面永久静止，不报任何错。
+                 *
+                 * 这是 2026-11-07 修 wlshot --loop 时发现的同类静默失败：
+                 * 「保持最后成功状态并继续宣称成功」比直接失败更难查。
+                 *
+                 * 退避策略：连续失败 3 帧后彻底切回 rpix（AHB 可能已损坏，
+                 * 每帧都试一次 lock 只是白白浪费 CPU），并把原因打出来。 */
+                ahb_fail_streak++;
+                if (ahb_fail_streak == 1) {
+                    P("warn: AHB lock failed (rc=%d addr=%p), falling back to glReadPixels\n",
+                      lock_rc, addr);
+                }
+                rp(0,0,W,H,0x1908,0x1401,pixels);
+                if (ahb_fail_streak >= 3 && use_ahb) {
+                    P("warn: AHB lock failed %d times, switching pixmode to rpix for good\n",
+                      ahb_fail_streak);
+                    use_ahb = 0;
+                }
             }
         } else {
             rp(0,0,W,H,0x1908,0x1401,pixels);

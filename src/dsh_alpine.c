@@ -1095,14 +1095,31 @@ static __attribute__((noinline)) void child_run_raw(long argc_dummy) {
     unsigned long ispan = ihi - ilo;
     (void)ispan;
     if (!guest_static) {
-        // 整段预留 anon RW（段间空隙为零页，可读写），随后文件映射覆盖文件部分
-        long rv = raw6(SYS_mmap, (long)(IHI + ilo), (long)ispan, 3 /*RW*/,
+        // 整段预留 anon RW（段间空隙为零页，可读写），随后文件映射覆盖文件部分。
+        //
+        // ★不能只靠 MAP_FIXED_NOREPLACE(0x100000)：它是 **Linux 4.17** 才有的标志。
+        //   老内核（实测 Android 模拟器 emulator-5554 是 **3.18.91**）不认识这个位，
+        //   会把它当「不认识的标志」忽略掉 —— 请求变成普通的 hint 型 mmap，
+        //   内核可以（也确实）返回**别的地址**，而下面 PT_LOAD 的 MAP_FIXED 与
+        //   慢路径的 pread64 全都按 IHI+ilo 这个绝对值来算 → 写进未映射区。
+        //   实测症状：mmap 返回 0x7e66ba588000（不是 0x7000000000），随后
+        //   `pread64(4, 0x70000a1aa0, 2404, 658080) = -1 EFAULT` → exit_group(131)
+        //   → 容器内所有需要 fork+exec 的操作（shell 跑任何外部命令、gcc 拉 cc1/as/ld）
+        //   全部静默失败。
+        //   修法：**必须校验返回地址 == 请求地址**，不等就用 MAP_FIXED 严格重来。
+        long want = (long)(IHI + ilo);
+        long rv = raw6(SYS_mmap, want, (long)ispan, 3 /*RW*/,
                        0x22 /*PRIVATE|ANON*/ | 0x100000 /*FIXED_NOREPLACE*/, -1, 0);
+        if (rv >= 0 && rv > -4096 && rv != want) {
+            // 内核给了别处：先撤掉这段「跑偏」的映射，再用 MAP_FIXED 严格落位
+            raw6(SYS_munmap, rv, (long)ispan, 0, 0, 0, 0);
+            rv = -1;
+        }
         if (rv < 0 && rv > -4096) {
-            raw6(SYS_munmap, (long)(IHI + ilo), (long)ispan, 0, 0, 0, 0);
-            rv = raw6(SYS_mmap, (long)(IHI + ilo), (long)ispan, 3, 0x32, -1, 0);
+            rv = raw6(SYS_mmap, want, (long)ispan, 3 /*RW*/, 0x32 /*PRIVATE|ANON|FIXED*/, -1, 0);
         }
         if (rv < 0 && rv > -4096) raw6(SYS_exit_group, 123, 0, 0, 0, 0, 0);
+        if (rv != want) raw6(SYS_exit_group, 123, 0, 0, 0, 0, 0);
     }
     if (!guest_static) {
         for (int i = 0; i < ieh->e_phnum; i++) {
@@ -1125,13 +1142,19 @@ static __attribute__((noinline)) void child_run_raw(long argc_dummy) {
     if (glo == ~0UL) raw6(SYS_exit_group, 122, 0, 0, 0, 0, 0);
     unsigned long gspan = ghi - glo;
     {
-        long rv = raw6(SYS_mmap, (long)(GHI + glo), (long)gspan, 3 /*RW*/,
+        // 同上：FIXED_NOREPLACE 在 4.17 之前的内核上会被忽略，必须校验落位地址。
+        long gwant = (long)(GHI + glo);
+        long rv = raw6(SYS_mmap, gwant, (long)gspan, 3 /*RW*/,
                        0x22 | 0x100000, -1, 0);
+        if (rv >= 0 && rv > -4096 && rv != gwant) {
+            raw6(SYS_munmap, rv, (long)gspan, 0, 0, 0, 0);
+            rv = -1;
+        }
         if (rv < 0 && rv > -4096) {
-            raw6(SYS_munmap, (long)(GHI + glo), (long)gspan, 0, 0, 0, 0);
-            rv = raw6(SYS_mmap, (long)(GHI + glo), (long)gspan, 3, 0x32, -1, 0);
+            rv = raw6(SYS_mmap, gwant, (long)gspan, 3, 0x32 /*FIXED*/, -1, 0);
         }
         if (rv < 0 && rv > -4096) raw6(SYS_exit_group, 121, 0, 0, 0, 0, 0);
+        if (rv != gwant) raw6(SYS_exit_group, 121, 0, 0, 0, 0, 0);
     }
     for (int i = 0; i < geh->e_phnum; i++) {
         if (gph[i].p_type != PT_LOAD) continue;

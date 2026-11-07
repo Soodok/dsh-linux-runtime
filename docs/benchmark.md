@@ -1916,3 +1916,57 @@ QEMU monitor 的 `sendkey` / `mouse_move` / `mouse_button` 直通。
 共享文件是 RGBA（4 字节/像素），写 PNG 时 `color type` 必须用 **6**（RGBA）。
 用 2（RGB）会得到「Unsupported or malformed image data」，两个看图器都打不开，
 而 PNG 结构与 CRC 全都合法 —— **又一次「结构正确 ≠ 内容正确」**。
+
+### 6.22 qscreensrv 修复后的干净复测（可复现脚本 `bench/qsrv_verify.sh`）
+
+**上一轮数字的可信度问题**（审查时发现，必须记下来）：
+
+`§6.21` 里的 9.0ms/帧、alpha≠255=0、seq=247 这些数字，当时是手工逐步操作得出的，
+**没有入库的原始输出与检查脚本**。而且「alpha≠255 的像素 0 个」在 `qscreensrv`
+产物上是**构造性必然**（源码每个像素都写 255），当成「实测发现」写会误导。
+`pmemsave` 的 16777216 B 也是脚本里固定 `0x1000000` 的 dump 长度，不是
+「guest 实际 framebuffer 大小」的独立测量 —— 两者必须分开表述。
+
+**修完 4 处缺陷后的干净复测**（脚本 `bench/qsrv_verify.sh`，先按 PID 精确
+清场并确认 0 残留）：
+
+```
+=== 1) 清场 ===
+  leftover=0
+=== 5) 轮询等共享文件 ===
+  SHARE READY after 0s
+=== 6) 共享文件头 ===
+-rw-r--r-- 1 root root 4096016 2026-11-07 21:34
+0000000 1296126534         19       1280        800
+=== 7) seq 增量（3 秒）===
+  seq 19 -> 49
+  delta=30
+=== 9) 判定 ===
+RESULT: QSRV_OK seq_delta=30
+```
+
+`delta=30 / 3 秒 = 10fps`，与设定一致 —— **这是「服务活着」的硬证据**，
+比「文件存在」或「日志有 STAT」强得多。
+
+拉回共享文件解析：
+
+```
+magic=0x4D415246 seq=151 w=1280 h=800 size=4096016 expect=4096016
+非零像素=42144  alpha!=255=0
+```
+
+解成 PNG（color type **6**，RGBA）后可读看到 guest 全屏 fbcon 内容，
+`/dev/fb0` 设备节点行、`[drm] Found bochs VGA` 等全部清晰。
+
+**两个验证工具坑（都不是被测代码的问题）**
+
+1. `busybox od` **不支持 `-j` 跳偏移**，静默返回空串 → 读共享文件头必须用
+   `dd bs=1 skip=4 count=4`。
+2. 旧进程没杀掉时，会往已被 `>` 截断的**同一日志**按旧偏移续写 → 日志出现
+   NUL 空洞、`seq` 从旧值（9638）续起，看起来像「服务正常」，实际是两次运行
+   混在一起。**验证前必须确认 `leftover=0`**。
+
+**PNG color type（第三次踩）**
+共享文件是 RGBA（4 字节/像素），写 PNG 时 `color type` 必须是 **6**。
+用 2（RGB）会得到「Unsupported or malformed image data」，而 PNG 结构与
+CRC 全部合法 —— 又一次「结构正确 ≠ 内容正确」。

@@ -2499,3 +2499,69 @@ ENVCOUNT 19；100KB → 用户可见
 修法：`python` 里用 `data.replace(b"\x00", b"\0")` 把真 NUL 换回字面反斜杠 0。
 **教训：改 C 源码里的 `\0` 文本时，一律用 raw 字符串或双反斜杠；
 改完用 `file` + `raw.count(b"\x00") == 0` 验一遍。** 探针里已加这条断言（E1）。
+
+## 66. cleaner 的 argv/env **条数**上限：静默丢弃 + 数组与阈值不同步会踩栈（2026-11-07）
+
+**症状**：环境变量数量一多，bionic 程序静默只拿到前一批，剩下的**整个消失**。
+
+实测（模拟器 dsh34 / x86_64，`envdump` 打印 `environ`）：
+
+```
+容器内 env 数量: 122
+ENVCOUNT=127 ENVBYTES=2230
+LASTENV=V116=val116          <- V117~V200 与 FINALVAR 全丢
+HAVE_LASTVAR=no              <- 程序侧看不出任何问题
+```
+
+容器里 busybox sh 大约只能 `export` 到 122 个变量，所以**刚好踩在 127 这条线上**；
+换成 bash 或 Node 跑构建脚本会轻松超过 127 —— 这是真实隐患，不是理论问题。
+
+**为什么危险**：读数不到的变量，程序就当成「没设」走默认值。
+比报错难查得多，而且完全没有任何日志。
+
+**★更糟的：修这个 bug 时踩到了栈溢出**
+
+我先做「只把数组改回 `ev[128]`」的反向验证，**但忘了同步改判断阈值
+`ec >= 255`**。结果指针往 `ev[128]` 里写到了下标 255 —— **越过数组末尾，把
+栈上相邻的 `av[]` 一起踩坏**，实测出现：
+
+```
+ARGV=90 [V134=val134] [V143=val143] ...   <- 环境变量被当成参数了
+```
+
+生产代码里这两个常量一旦不同步就是栈溢出，比原 bug 严重得多。
+所以**数组大小与阈值必须由同一个宏派生**：
+
+```c
+#define ARGV_MAX 63
+#define ENV_MAX  255
+
+char *av[ARGV_MAX + 1]; int ac = 0;
+char *ev[ENV_MAX + 1];  int ec = 0;
+...
+if (ac >= ARGV_MAX) { too_many = 1; break; }
+if (ec >= ENV_MAX)  { too_many = 1; break; }
+```
+
+**超限必须显式失败**（不能执行半截请求）：
+
+```c
+if (too_many) {
+    ldr_puts("dsh: bionic exec refused: argv or env count exceeds limit ");
+    ldr_log1("(argv<=", ARGV_MAX, 10); ldr_log1(" env<=", ENV_MAX, 10);
+    ldr_puts(") got argv="); ldr_log1("", ac, 10);
+    ldr_log1(" env=", ec, 10); ldr_puts("");
+    unsigned char bad = 125;
+    raw6(SYS_write, cfd, (long)&bad, 1, 0, 0, 0);
+    raw6(SYS_close, cfd, 0, 0, 0, 0, 0);
+    continue;
+}
+```
+
+**修后实测**：122 个变量 → `ENVCOUNT=218`、`LASTENV=FINALVAR=IM_THE_VERY_LAST`；
+把 `ENV_MAX` 反向改成 127 → 用户可见
+`dsh: bionic exec refused: argv or env count exceeds limit (argv<=63 env<=127) got argv=1 env=127`。
+
+**部署核对（本项第三次踩）**：改完必须比 md5。有一次 `cp` 到运行中的文件
+静默失败，设备上还是旧产物（`5789d41e` vs 本地产物 `19787cdd`），我据此
+差点得出「反向验证无效」的结论。**先 `rm -f` 再 `cp`，然后 `md5sum` 比对。**

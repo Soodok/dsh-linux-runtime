@@ -114,6 +114,115 @@ static void reg_global(void *d, struct wl_registry *r, uint32_t name,
 }
 static const struct wl_registry_listener reg_listener = { reg_global, NULL };
 
+/* ---- 重连与退避（--loop 容错用）----
+ *
+ * 这几个函数只服务 --loop 的恢复路径，单帧模式走不到。
+ *
+ * 为什么需要：compositor 会重启（用户 `pkill sway` 再起、或崩溃后被拉起），
+ * 那时 wl_display_roundtrip 返回 -1，老实现直接 break 退出 → 帧服务永久停，
+ * 而 App 侧只看到画面静止。重连能让它在 compositor 回来后自己接上。
+ */
+
+/* 毫秒退避：1,2,4,8...最多 2000ms。不做精确调度，只为别把 CPU 打满。 */
+static void backoff_ms(int consec) {
+    int ms = 100 << (consec > 5 ? 5 : (consec > 0 ? consec - 1 : 0));
+    if (ms > 2000) ms = 2000;
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) < 0 && errno == EINTR) { }
+}
+
+/* 重建共享文件（尺寸变化时用）。
+ *
+ * 布局：[16B header][pixels]。header 存 magic/seq/w/h，seq 最后写。
+ * 重建后 seq 会从头来过也没关系 —— App 侧只比对「变了没有」。
+ * 返回 0 成功。
+ */
+static int fw_reinit(int *pfd, void **pmap, unsigned char **phdr, size_t *ptotal,
+                     size_t *ppixbytes, int w, int h,
+                     unsigned *pout_w, unsigned *pout_h, const char *share) {
+    size_t pix = (size_t)w * (size_t)h * 4u;
+    size_t tot = DSH_FRAME_HDR + pix;
+
+    if (*pmap) { munmap(*pmap, *ptotal); *pmap = NULL; }
+    if (*pfd >= 0) { close(*pfd); *pfd = -1; }
+
+    int fd = open(share, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "FAIL reinit open %s: %s\n", share, strerror(errno));
+        return -1;
+    }
+    if (ftruncate(fd, (off_t)tot) != 0) {
+        fprintf(stderr, "FAIL reinit ftruncate: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    void *m = mmap(NULL, tot, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        fprintf(stderr, "FAIL reinit mmap: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    *pfd = fd;
+    *pmap = m;
+    *phdr = (unsigned char *)m;
+    *ptotal = tot;
+    *ppixbytes = pix;
+    *pout_w = (unsigned)w;
+    *pout_h = (unsigned)h;
+
+    /* magic 先写、seq 清零 —— 下一帧成功后会写真实 seq */
+    put_u32(*phdr + 0, DSH_FRAME_MAGIC);
+    put_u32(*phdr + 4, 0u);
+    put_u32(*phdr + 8, (unsigned)w);
+    put_u32(*phdr + 12, (unsigned)h);
+    return 0;
+}
+
+/* 重连 display 并重新绑 global。
+ *
+ * 注意 outputs 数组是 realloc 来的，重连时先释放旧指针再清零重生，
+ * 否则会泄漏并让 outputs[0] 指向已销毁的 wl_output。
+ * 返回 0 成功。
+ */
+static int reconnect(struct wl_display **pdisp, struct wl_shm **pshm,
+                     struct zwlr_screencopy_manager_v1 **pscm,
+                     struct wl_output ***poutputs, int *pn_outputs) {
+    if (*pdisp) { wl_display_disconnect(*pdisp); *pdisp = NULL; }
+
+    /* 先清全局，registry 回调会重新填 */
+    *pshm = NULL;
+    *pscm = NULL;
+    if (*poutputs) { free(*poutputs); *poutputs = NULL; }
+    *pn_outputs = 0;
+    cap_outputs = 0;
+
+    struct wl_display *d = wl_display_connect(NULL);
+    if (!d) return -1;
+    struct wl_registry *reg = wl_display_get_registry(d);
+    if (!reg) { wl_display_disconnect(d); return -1; }
+    wl_registry_add_listener(reg, &reg_listener, NULL);
+    if (wl_display_roundtrip(d) < 0) {
+        wl_display_disconnect(d);
+        return -1;
+    }
+
+    *pdisp = d;
+    *pshm = shm;
+    *pscm = scm;
+    *poutputs = outputs;
+    *pn_outputs = n_outputs;
+
+    if (!*pshm || !*pscm || *pn_outputs <= 0) {
+        wl_display_disconnect(d);
+        *pdisp = NULL;
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const char *share = (argc > 1) ? argv[1] : NULL;
     int timeout_ms = (argc > 2) ? atoi(argv[2]) : 3000;
@@ -234,6 +343,8 @@ int main(int argc, char **argv) {
     unsigned seq = 0;
     int iter = 0;
     int frames_ok = 0;
+    int consec_fail = 0;
+    const int MAX_CONSEC = 30;   /* 连续失败 30 帧（约 15s@2fps）才放弃 */
 
     for (;; iter++) {
         if (iter > 0) {
@@ -241,16 +352,81 @@ int main(int argc, char **argv) {
             fr = zwlr_screencopy_manager_v1_capture_output(scm, 0, outputs[0]);
             zwlr_screencopy_frame_v1_add_listener(fr, &frame_listener, NULL);
             for (spin = 0; spin < timeout_ms / 10 && f_w == 0 && !failed; spin++) {
-                if (wl_display_roundtrip(disp) < 0) break;
+                if (wl_display_roundtrip(disp) < 0) { failed = 2; break; }
             }
+
+            /* ★出错不退出，退避后继续。
+             *
+             * 原来的实现这里 `break` 直接跳出去 —— compositor 重启一次，
+             * 帧服务就永久停了，而 App 侧只是「画面不动」，看不到任何错误。
+             * 单帧失败是可恢复的：重建 frame 对象重来即可。 */
             if (failed || f_w <= 0) {
-                fprintf(stderr, "FAIL loop frame %d: no buffer event\n", iter);
-                break;
+                consec_fail++;
+                if (consec_fail == 1 || consec_fail % MAX_CONSEC == 0) {
+                    fprintf(stderr,
+                            "WARN loop frame %d: no buffer event (failed=%d, consec=%d)\n",
+                            iter, failed, consec_fail);
+                }
+                if (fr) { zwlr_screencopy_frame_v1_destroy(fr); fr = NULL; }
+                /* failed==2 表示 roundtrip 返回 <0，连接大概率断了 → 重建。
+                 *
+                 * ★重连失败时绝不能直接 continue：reconnect() 失败会把
+                 *   scm/outputs 清成 NULL，下一轮开头 capture_output(NULL,...)
+                 *   会段错误，进程无日志消失（我第一版就这么死的）。
+                 *   所以这里在内层循环里重试，直到连上或耗尽次数。 */
+                while (failed == 2) {
+                    if (consec_fail >= MAX_CONSEC) {
+                        fprintf(stderr,
+                                "WARN loop frame %d: giving up after %d failures\n",
+                                iter, consec_fail);
+                        goto giveup;
+                    }
+                    if (reconnect(&disp, &shm, &scm, &outputs, &n_outputs) == 0) {
+                        fprintf(stderr, "WARN loop frame %d: reconnected\n", iter);
+                        /* ★重连后 buf 属于旧 display 的 shm，已失效。
+                         *   把 out_w 清零，逼下面的「尺寸变化」分支重建
+                         *   wl_buffer；否则尺寸相同时不重建 → 悬垂指针。 */
+                        out_w = 0; out_h = 0;
+                        /* buf 也属于旧 display 的 shm，同样不能再用。置 NULL
+                         * 让下面的重建分支跳过 destroy，只 create 新的。 */
+                        buf = NULL;
+                        break;
+                    }
+                    consec_fail++;
+                    backoff_ms(consec_fail);
+                }
+                if (consec_fail >= MAX_CONSEC) goto giveup;
+                backoff_ms(consec_fail);
+                continue;
             }
+
+            /* 尺寸变化：共享文件按新尺寸重建，不退出。
+             * App 侧读 header 的 w/h，会自动跟着变。 */
             if (f_w != (int)out_w || f_h != (int)out_h) {
-                fprintf(stderr, "FAIL loop frame %d: size changed %dx%d -> %dx%d\n",
+                fprintf(stderr, "WARN loop frame %d: size changed %dx%d -> %dx%d\n",
                         iter, out_w, out_h, f_w, f_h);
-                break;
+                if (fw_reinit(&fd, &map, &hdr, &total, &pixbytes,
+                              f_w, f_h, &out_w, &out_h, share) != 0) {
+                    fprintf(stderr, "WARN loop frame %d: reinit share failed\n", iter);
+                    consec_fail++;
+                    if (consec_fail >= MAX_CONSEC) goto giveup;
+                    backoff_ms(consec_fail);
+                    continue;
+                }
+                /* shm buffer 也要按新尺寸重建 */
+                if (ftruncate(tfd, (off_t)pixbytes) != 0) {
+                    fprintf(stderr, "WARN loop frame %d: tmp ftruncate: %s\n",
+                            iter, strerror(errno));
+                    consec_fail++;
+                    if (consec_fail >= MAX_CONSEC) goto giveup;
+                    backoff_ms(consec_fail);
+                    continue;
+                }
+                pool = wl_shm_create_pool(shm, tfd, (int32_t)pixbytes);
+                if (buf) { wl_buffer_destroy(buf); buf = NULL; }
+                buf = wl_shm_pool_create_buffer(pool, 0, f_w, f_h,
+                                                (int32_t)stride, f_format);
+                wl_shm_pool_destroy(pool);
             }
         }
 
@@ -261,9 +437,17 @@ int main(int argc, char **argv) {
             if (wl_display_roundtrip(disp) < 0) break;
         }
         if (failed || !f_ready) {
-            fprintf(stderr, "FAIL frame %d: copy failed=%d ready=%d\n",
-                    iter, failed, f_ready);
-            break;
+            /* 同样是可恢复错误：copy 超时/被取消，下一帧重来即可。 */
+            consec_fail++;
+            if (consec_fail == 1 || consec_fail % MAX_CONSEC == 0) {
+                fprintf(stderr,
+                        "WARN frame %d: copy failed=%d ready=%d (consec=%d)\n",
+                        iter, failed, f_ready, consec_fail);
+            }
+            if (fr) { zwlr_screencopy_frame_v1_destroy(fr); fr = NULL; }
+            if (consec_fail >= MAX_CONSEC) goto giveup;
+            backoff_ms(consec_fail);
+            continue;
         }
 
         /* 从 tmp 映射读到共享文件。XRGB8888 小端字节序是 B,G,R,X */
@@ -309,6 +493,7 @@ int main(int argc, char **argv) {
 
         zwlr_screencopy_frame_v1_destroy(fr);
         fr = NULL;
+        consec_fail = 0;   /* 成功一帧就清零 */
 
         if (!loop_mode) break;
         if (loop_fps > 0) {
@@ -319,6 +504,11 @@ int main(int argc, char **argv) {
         }
     }
 
+giveup:
+    if (frames_ok == 0 || consec_fail > 0) {
+        fprintf(stderr, "WARN final: frames_ok=%d consec_fail=%d\n",
+                frames_ok, consec_fail);
+    }
     printf("WLSHOT_KV copied=%d\n", frames_ok);
     printf("WLSHOT_KV seq=%u\n", seq);
     printf("WLSHOT_KV bytes=%zu\n", pixbytes);

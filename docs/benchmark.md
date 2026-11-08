@@ -2230,3 +2230,99 @@ guest 内 /proc/meminfo:    MemTotal = 8138296 kB = 7.8 GB   ✓ 生效
 
 要在手机上获得可用的 Android-in-Android 体验，正确路径是 **arm64 真机
 直接跑**（零套娃），而非在模拟器里再套一层。
+
+---
+
+## 18. 触摸回传：容器画面可控（XTEST 长连接，p50 = 1.3 ms）
+
+让 App 画面上「点一下」真的作用到容器里的程序。两条 compositor 路线都实测
+否证后，最终落定 X11 + XTEST。
+
+### 为什么不是 Wayland
+
+生产画面路径原本是 sway（Wayland）+ wlshot，逐个试过三条注入路，全部失败：
+
+| 方案 | 结果 | 根因 |
+|---|---|---|
+| `wlrctl`（wlroots 官方 virtual-pointer/keyboard） | `rc=0` **静默成功但事件不到** | 需要 wlroots 虚拟设备协议参与握手，且多次 `Assertion failed: state.display (../main.c: main: 177)` 后 `Aborted` |
+| `uinput`（`/dev/uinput`，`CONFIG_INPUT_UINPUT=y`） | 设备创建成功，容器内 `/dev/input/event13 = dsh-touch` 真实出现，**但 `swaymsg -t get_inputs` 返回 `[]`** | ① `WLR_BACKENDS=headless` **只创建输出、不扫描任何输入设备**（`sway -d` 日志里 libinput 出现 0 次）② 换 `WLR_BACKENDS=libinput` 起不来 |
+| 给 sway 加 seat | 起不来 | `libseat`：`Could not connect to socket /run/seatd.sock` / `Backend 'seatd' failed to open seat` / `Backend 'logind' failed to open seat` / `No backend was able to open a seat` —— **libinput 后端必须先有 seat，seat 只能来自 seatd 或 logind**，容器里两者都没有 |
+
+附带收获：uinput 创建的设备**不会被 Android 宿主看到**（`dumpsys input` 里
+`grep -c dsh-touch` = 0、`getevent` 设备数不变 13），所以这条路即便走通也
+不会污染宿主输入。
+
+另注：`WLR_LIBINPUT_NO_DEVICES=1` 是「无输入设备也能起 headless sway」用的，
+设了它等于**主动让 sway 忽略所有输入设备**，排查时容易误判成「设备没被认到」。
+
+### X11 路线：两个程序就够
+
+| 程序 | 作用 | 产物 |
+|---|---|---|
+| `bench/x11frsrv.c` | `XShmGetImage`（回落 `XGetImage`）连续抓 X 根窗口 → 写共享文件 | 19504 B |
+| `bench/inputd.c` | 常驻 XTEST 长连接，轮询共享文件 → 注入 motion/button | 19248 B |
+
+两者的共享文件协议与既有 `framesrv.c` **完全一致**（`magic=0x4D415246` /
+seq / w / h / RGBA8888），所以 App 侧 `LinuxFrameSurface` 一行不用改。
+
+`inputd` 的协议是另一份（`magic=0x54504E49 "INPT"`）：头 32 字节
+（magic/head/tail/capacity/flags）+ 每条 16 字节（type/x/y/buttons）。
+`head`/`tail` **单调递增不取模**，取模只用于定位条目 —— 满/空只看减法，
+不会因 32 位回绕判错；队列满时覆盖最旧的（生产者永不阻塞 UI）。
+
+### 实测
+
+**抓帧延迟**（1280×720 / 60fps 目标，5 秒采 seq 增量）：
+
+```
+5s 内 seq: 111 -> 390  实际 fps=55
+share=3686416 期望=16+1280*720*4=3686416
+```
+
+无 XShm 也能到 55 fps（`shm=0`，Xvfb 的 MIT-SHM 用不上，走 `XGetImage`）。
+
+**注入延迟**（30 次，写事件 → 目标程序收到）：
+
+```
+LAT n=30  min=853us  p50=1339us  max=4592us
+```
+
+**中位 1.3 毫秒**，比每次起 `xdotool`（实测约 200ms）快约 150 倍。
+
+**坐标精确性**（内容窗口在 (10,10)）：
+
+```
+写入：MOVE(200,150) → DOWN(200,150) → MOVE(250,180) → UP
+收到：MOVE x=190 y=140 / PRESS x=190 y=140 btn=1 / MOVE x=240 y=170 / RELEASE x=240 y=170
+```
+
+**端到端像素证据** —— App 会看到的帧里（放大后清晰可读）：
+
+```
+CONTAINER READY
+x86_64
+3.22.2
+~ # AI-TOUCHED-THIS-WINDOW
+/bin/sh: AI-TOUCHED-THIS-WINDOW: not found     ← 程序真的执行了
+~ # echo FRAME-SYNC-OK
+FRAME-SYNC-OK                                   ← 输出回到帧里
+~ #
+```
+
+### 三个实现要点（都是踩过才知道）
+
+1. **alpha 必须显式写 255**。Xvfb 24bpp 是 BGRX 排布，第 4 字节是 `unused`
+   不是 alpha，实测可能全 0 —— App 侧 `ARGB_8888` 会当真读，整帧被判全透明，
+   用户看到一片空白且**不报任何错**（这个坑在 wlshot 上踩过一次）。
+2. **seq 最后推进**。先推 seq 会让 App 读到半帧。
+3. **Xvfb 的 abstract socket 残留**。上一实例没退干净时新实例报
+   `Fatal server error: Cannot establish any listening sockets`，而此时
+   `/tmp/.X11-unix/` 目录看起来是空的 —— 必须 `rm -rf /tmp/.X11-unix` 重建，
+   换 display 号只是绕过、不是修复。
+
+### 相关
+
+- 新增 `app/src/main/java/app/dsh/mobile/engine/LinuxInputChannel.kt`（协议实现
+  + 坐标换算）、`LinuxActivity` 的触摸开关、`LinuxEnvironmentManager` 的
+  `installLinuxTool()` 部署（幂等戳带字节数）
+- 同族：pitfalls #30（软链绝对路径）、#64（Android-x86 引导）

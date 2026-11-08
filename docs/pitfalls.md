@@ -2854,3 +2854,80 @@ doesn't work!`；`-smp 2` + `noapic` 正常。`-smp 2` + `-m 1024` 也能引导�
 
 - 脚本：`scripts/setup_rootenv.sh`（root 域容器环境一键重建）
 - 同族：pitfalls #63（QEMU fb0 取画面）、#59（`pkill -f` 自杀）
+
+---
+
+## #65 容器触摸注入：Wayland 三条路全否，X11 一条通
+
+想把「App 画面上点一下」送到容器里的程序。图层顺序决定了可行方案，
+而三次否证都是**静默或误导性**的，值得记下来。
+
+### 症状一：`wlrctl` 静默成功
+
+```
+$ wlrctl toplevel focus app_id:dshfoot ; echo $?
+0
+$ wlrctl keyboard type 'HELLO' ; echo $?
+0
+```
+
+两行都 rc=0，但 foot 里一个字符都没收到。多次调用后还会
+`Assertion failed: state.display (../main.c: main: 177)` → `Aborted`。
+**rc=0 不等于生效** —— 这是最费时间的一种失败。
+
+### 症状二：uinput 设备创建成功但 compositor 不认
+
+```
+$ ./uctl dsh-touch        # 创建虚拟触摸屏
+UCTL_KV created=dsh-touch
+$ ls /dev/input/ | grep event | wc -l
+14                        # 多了一个，确实创建了
+$ swaymsg -t get_inputs
+[]                        # ← sway 一个都没认到
+```
+
+`sway -d` 日志里 `grep -ic libinput` = **0**。根因是
+`WLR_BACKENDS=headless` 只创建输出、**不扫描任何输入设备**。
+
+### 症状三：换 libinput 后端直接起不来
+
+```
+$ WLR_BACKENDS=libinput sway
+[ERROR] [libseat] Could not connect to socket /run/seatd.sock
+[ERROR] [libseat] Backend 'seatd' failed to open seat, skipping
+[ERROR] [libseat] Backend 'logind' failed to open seat, skipping
+[ERROR] [libseat] No backend was able to open a seat
+[ERROR] [wlr] Unable to create seat: Function not implemented
+```
+
+**libinput 后端必须先有 seat，seat 只能来自 seatd 或 logind。** 容器里
+不跑 systemd、不跑特权守护，两者都没有。这不是配置问题，是架构前提。
+
+### 附带教训：一个环境变量的双重含义
+
+`WLR_LIBINPUT_NO_DEVICES=1` 本意是「没有输入设备也要能起 headless sway」，
+但它等于**主动让 sway 忽略所有输入设备**。排查时会表现为
+「设备明明在，compositor 就是认不到」，极易误判成 uinput 没工作。
+
+### 正解：X11 + XTEST 常驻长连接
+
+`bench/x11frsrv.c`（抓帧）+ `bench/inputd.c`（注入），协议与既有 framesrv
+一致。实测 **p50 = 1.3 ms**，比每次起 `xdotool`（约 200ms）快 150 倍。
+
+关键实现点：
+
+- **alpha 必须显式写 255**。Xvfb 24bpp 的 BGRX 里第 4 字节是 `unused`，
+  可能全 0 → App 侧 `ARGB_8888` 当真读 → 整帧全透明 → 用户看到空白，
+  **不报任何错**。
+- **seq 最后推进**，否则 App 读到半帧。
+- **共享文件 `open` 用 `O_RDWR|O_CREAT` 但不带 `O_TRUNC`**：生产顺序不保证
+  （手工调试、容器重启、App 还没打开画面卡时注入器可能先跑），但已有事件
+  不能被静默丢掉。
+- **Xvfb 残留 abstract socket** → `rm -rf /tmp/.X11-unix` 重建；换 display 号
+  只是绕过不是修复（目录看起来是空的，容易误判）。
+
+### 判据
+
+- ✅ 不能只看「命令 rc=0」，要看**目标程序的状态真的变了**（帧里出现新文字）
+- ✅ 坐标要精确对应（内容窗口偏移 10 像素这种细节也要对上）
+- ✅ 注入后必须**抓一帧看图**，不能只看进程数量或日志

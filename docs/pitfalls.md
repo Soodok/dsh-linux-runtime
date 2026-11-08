@@ -2748,3 +2748,109 @@ fbcon 文本画面**：内核日志每一行都是可读字形，前景 `#AAAAAA
 - 脚本：`bench/qemu_boot.sh`（`serial` / `screen` 两种模式）
 - 同族：pitfalls #59（pkill 自杀）、#35（AF_UNIX 路径翻译，QEMU 的
   `/tmp/ser.txt` 也依赖它）
+
+---
+
+## #64 Android-x86 在容器内引导：三个参数错一个就永远停在打点
+
+在 dsh-linux-runtime 容器里用 QEMU 跑 Android-x86 9.0-r2，从「无限打点」
+到「内核完整引导 + 硬件全识别 + 进图形模式」的完整排障记录。
+
+### 症状与三个互相独立的原因
+
+**症状 A：`Detecting Android-x86...` 后无限打印点号（实测 4 分钟近 200 个点）**
+
+`initrd` 里 `init` 的 `check_root()` 是这个逻辑：
+
+```sh
+if [ -e /mnt/$SRC/$RAMDISK ]; then
+    zcat /mnt/$SRC/$RAMDISK | cpio -id
+elif [ -e /mnt/$SRC/system.sfs ]; then
+    mount -o loop,noatime /mnt/$SRC/system.sfs system
+```
+
+**`$SRC` 是「挂载根下的目录名」，不是文件路径。** 我传了
+`SRC=/iso/system.sfs`，它去找 `/mnt/iso/system.sfs/ramdisk.img` ——
+永远不存在，于是 `while :; do ... sleep 1; echo -n .; done` 无限循环。
+
+正确做法：**ISO 根目录本身就有 `ramdisk.img` 与 `system.sfs`，`SRC` 必须留空**。
+
+**症状 B：卡在 `Type 'exit' to continue booting...`**
+
+`-append` 里带了 `DEBUG=1`。`init` 中：
+
+```sh
+if [ 0$DEBUG -gt 1 ]; then
+    debug_shell debug-late
+fi
+```
+
+`DEBUG=1` 时 `[ 01 -gt 1 ]` 为假所以不阻塞，但**串口日志第 350 行确实出现了
+`Type 'exit' to continue booting...`**（`DEBUG=1` 走的是另一处 `debug_shell debug-found`）。
+想不阻塞就**别传 `DEBUG`**；想用 debug shell 就得能往 tty0 送键盘，而
+`-monitor` 的 `sendkey` 在 `-display none` + `console=tty0` 组合下送不进
+（实测发 `e x i t ret` 后日志行数不变）。
+
+**症状 C：VGA 截图全黑，误判「卡死」**
+
+只给 `console=ttyS0,115200` 时，内核文本**全部走串口**，VGA 上什么都不画，
+`screendump` 必然全黑。加 `console=tty0` 才有画面：
+
+```
+-append "root=/dev/ram0 androidboot.hardware=android_x86_64 \
+         console=tty0 console=ttyS0,115200 noquiet noapic"
+```
+
+### 可用的完整命令
+
+```sh
+# 前置：ISO 已推到 /data/local/tmp/ax86.iso，容器内 apk add qemu-system-x86_64
+$AX -m /iso:/data/local/tmp $RF /lib/ld-musl-x86_64.so.1 /bin/sh -c '
+  export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  cd /tmp
+  setsid qemu-system-x86_64 -m 4096 -smp 2 -cpu qemu64 \
+    -kernel /iso/kernel -initrd /iso/initrd.img \
+    -append "root=/dev/ram0 androidboot.hardware=android_x86_64 \
+             console=tty0 console=ttyS0,115200 noquiet noapic" \
+    -cdrom /iso/ax86.iso -vga std -display none \
+    -serial file:/tmp/g.log \
+    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:6555-:5555 -device e1000,netdev=n0 \
+    -monitor tcp:127.0.0.1:5591,server,nowait </dev/null >/tmp/g.err 2>&1 &
+'
+```
+
+`-smp 4` + `-m 4096` 在 TCG 下会 `Kernel panic - not syncing: IO-APIC + timer
+doesn't work!`；`-smp 2` + `noapic` 正常。`-smp 2` + `-m 1024` 也能引导，
+但宿主机本身内存紧张时 page cache 反复回收，挂载 942 MB 的 `system.sfs` 极慢。
+
+### 已实证的引导里程碑（模拟器 dsh34 / x86_64 / Android 14）
+
+| 阶段 | 证据 |
+|---|---|
+| ISO 完整 | 965738496 B，卷标 `Android-x86 9.0-r2 (x86_64)` |
+| 引导菜单 | 截图可见 Live CD / Installation / Advanced options |
+| 内核 | `Linux version 4.19.110-android-x86_64-g066cc1d` |
+| CDROM 检测 | `Detecting Android-x86... found at /dev/sr0` |
+| 硬件 | `input: AT Translated Set 2 keyboard`、`e1000 ... eth0`、`PC Speaker`、`ImExPS/2 Generic Explorer Mouse` |
+| 显示 | 分辨率从 720×400 文本切到 1024×768 图形 |
+| 移交 Android | `exec ${SWITCH:-switch_root} /android /init` 之后清屏、CPU 2 vCPU 满载 |
+
+**最后一步没等到画面**：`switch_root` 之后 Android init 清屏，CPU 持续满载
+（每 60 秒推进 27 秒 CPU 时间），符合首启 `dex2oat` 特征。droideum-termux
+在同样 TCG 环境下记录 `system_server` 在 `DexOptimizer` 待 >10 分钟、
+60~90 秒/应用，它跑到 40 分钟放弃。
+
+### 判据教训（这轮最关键）
+
+- **「VGA 全黑」不是「卡死」**。要先确认内核文本到底输出到哪个 console。
+- **「CPU 满载」不等于「在启动」**，要看它是否在推进（`/proc/<pid>/stat`
+  的 utime+stime 增量）。这轮就是靠它区分「dex2oat 在算」与「idle 等输入」。
+- **`-smp 4` 引发 kernel panic 是参数问题，不是镜像问题**，别急着换镜像。
+- **内存加到 4 GB 后真正的瓶颈才显露**：TCG 无 KVM（手机无 `/dev/kvm`、
+  `cpuinfo` 无 `vmx`），安卓启动的 dex2oat 是 CPU 密集型，纯软件模拟下
+  这一步就是几十分钟到数小时。
+
+### 相关
+
+- 脚本：`scripts/setup_rootenv.sh`（root 域容器环境一键重建）
+- 同族：pitfalls #63（QEMU fb0 取画面）、#59（`pkill -f` 自杀）

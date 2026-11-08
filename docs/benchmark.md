@@ -2151,3 +2151,82 @@ dshgui demo geany       # IDE 打开 demo.c
 2. **Xvfb 没起时自动拉起**，不要求调用方先手动 `dshgui start`
 3. 前置文件（`/tmp/site/index.html`、`/tmp/demo.c`）**只在不存在时创建**，
    绝不覆盖用户改过的内容
+
+---
+
+## 17. 容器内 QEMU 引导 Android-x86：里程碑与耗时
+
+在 dsh-linux-runtime 容器里（Alpine 3.22 x86_64，seccomp 容器）用
+`qemu-system-x86_64 10.0.0` 引导 Android-x86 9.0-r2，走 `TCG`（无 KVM）。
+
+### 环境
+
+| 项 | 值 |
+|---|---|
+| 设备 | 模拟器 `emulator-5554`，AVD dsh34，Android 14，x86_64，API 34 |
+| 设备内存 | 7812 MB（AVD 从 1536M 调到 8192M 后生效，`/proc/meminfo` 实测） |
+| guest 内存 | 4096 MB（`-m 4096`） |
+| vCPU | 2（`-smp 2 -cpu qemu64`） |
+| 加速 | **无**（`/dev/kvm` 不存在，`cpuinfo` 无 `vmx`） |
+| ISO | `android-x86_64-9.0-r2.iso`，965738496 B |
+| QEMU | `apk add qemu-system-x86_64` → 10.0.0-r1，81 MiB / 63 packages |
+
+### 里程碑时间（串口 `console=ttyS0` + VGA `console=tty0`）
+
+| 秒 | 事件 |
+|---|---|
+| 0.00 | `Linux version 4.19.110-android-x86_64-g066cc1d` |
+| 0.86 | `ata2.00: ATAPI: QEMU DVD-ROM` / `sr0` 识别 |
+| 1.00 | `Run /init as init process` |
+| ~11 | `input: AT Translated Set 2 keyboard` |
+| ~60.2 | `e1000: Intel(R) PRO/1000 Network Driver` / `eth0` |
+| ~60.7 | `input: PC Speaker` |
+| ~62.0 | `input: ImExPS/2 Generic Explorer Mouse` |
+| ~62+ | 分辨率 720×400(文本) → 1024×768(图形)，`switch_root /android /init` |
+
+之后 Android init 清屏，CPU 保持 2 vCPU 满载（实测每 60 秒推进 ~27 秒
+utime+stime），符合首启 `dex2oat` 特征，**未等到桌面画面**。
+
+### 内存对引导的影响（同一命令只改 `-m`）
+
+| guest 内存 | 现象 |
+|---|---|
+| 1024 MB | 能引导到 `found at /dev/sr0`，但挂载 942 MB `system.sfs` 极慢（page cache 反复回收） |
+| 4096 MB + `-smp 4` | **`Kernel panic - not syncing: IO-APIC + timer doesn't work!`** |
+| 4096 MB + `-smp 2` + `noapic` | 正常引导，硬件全识别，进图形模式 |
+
+### 宿主内存的真实数字（澄清一个常见误读）
+
+```
+宿主物理内存:              31.8 GB
+AVD config.ini 原始:       hw.ramSize = 1536M   ← 只用了 4.8%
+改后:                      hw.ramSize = 8192M
+guest 内 /proc/meminfo:    MemTotal = 8138296 kB = 7.8 GB   ✓ 生效
+宿主任务管理器:
+  emulator.exe             0.01 GB   ← 只是外壳
+  qemu-system-x86_64       6.82 GB WorkingSet / 2.00 GB Private
+```
+
+任务管理器里看到「1.3 GB」是因为 `emulator.exe`（外壳）与
+`qemu-system-x86_64-headless`（真正干活）是**两个进程**，且「内存」列
+显示的是私有工作集而非提交量。判断内存是否生效**以 guest 内
+`/proc/meminfo` 为准**。
+
+### 取画面的两种方式
+
+| 方式 | 产物 | 适用 |
+|---|---|---|
+| `screendump` (monitor) | PPM，9 ms/帧 | 常态；文本/图形模式都能取 |
+| `pmemsave` (monitor) | 裸 framebuffer | 需要绕过 VGA 时；**路径必须相对**（HMP 把 `/` 当除号） |
+
+`-display none` 下 `screendump` 仍可用，无需 VNC。
+
+### 结论
+
+容器内引导 Android-x86 的**链路是通的**（内核、设备、显示、移交 Android
+全部实证）。剩余「看到桌面」这一步的瓶颈是 **TCG 纯软件模拟下的
+`dex2oat`**，不是参数或配置问题。droideum-termux 在同类环境下对这一步
+的结论是 `the tool works; this host is too small to finish the last step`。
+
+要在手机上获得可用的 Android-in-Android 体验，正确路径是 **arm64 真机
+直接跑**（零套娃），而非在模拟器里再套一层。

@@ -2093,3 +2093,61 @@ after  RGB = (0, 204, 68)    ← 0x00CC44
 
 用户/用户委托的 AI 可以在手机上完成：写代码 → 编译 → 运行带界面的程序 →
 看到画面 → 点按钮 → 确认程序响应。全程不需要电脑，也不需要 root。
+
+### 6.22 容器内跑真实桌面应用：NetSurf 浏览器 + Geany IDE
+
+前面的 xterm / xclock / xcalc / xeyes 是**最小 X11 客户端** —— 它们只能
+证明 X 协议通、能画窗口、能收点击。要做到「手机端工作站」，必须证明
+**真实桌面应用**能跑，因为它们的依赖面完全不同：
+
+| 依赖 | 最小 X11 客户端 | 真实桌面应用 |
+|---|---|---|
+| X11 协议 | ✅ 需要 | ✅ 需要 |
+| 字体栈（fontconfig + FreeType + 字体文件） | 部分（内嵌位图字体） | ✅ 必须 |
+| GTK/主题引擎 + 图标主题 | ❌ 不需要 | ✅ 必须 |
+| 文件选择器 / GIO | ❌ | ✅ 必须 |
+| 会话/配置目录 | ❌ | ✅ 必须 |
+| 剪贴板 | ❌ | ✅ 必须 |
+
+**实测结果**
+
+| 软件 | 体积增量 | 窗口 | 渲染证据 |
+|---|---|---|---|
+| `netsurf`（自带 HTML/CSS 引擎的浏览器） | +11 MiB（已在 2167 MiB GTK 基础上） | `[Netsurf on Android - NetSurf]` 1000×700 | 截图 37157 B：蓝色 40px 标题、带 2px 描边和 10px 圆角的卡片、粉色加粗行内文字、带表头底色的表格、地址栏与 `Done (0.0s)` 状态栏 |
+| `geany`（GTK 代码编辑器/IDE） | +21 MiB | `[demo.c - /tmp - Geany]` 900×600 | 截图 50425 B：9 项菜单栏、左侧 Symbols 树解析出 `fib [4]` / `main [8]`、行号列、C 语法高亮（`#include` 蓝、字符串橙、注释红）、行内光标、底部 Message 面板 `File /tmp/demo.c opened (1).` |
+
+**为什么 chromium 不行（诚实记录）**
+
+`chromium` 装好了（2167 MiB / 414 包，`rc=0`），`--version` 能输出
+`Chromium 142.0.7444.59`，窗口也能创建（`[Untitled - Chromium]` 1279×799），
+但**渲染不出内容**：
+
+```
+LaunchProcess: failed to execvp:
+/proc/self/exe
+[pid:tid:...:ERROR:content/browser/network_service_instance_impl.cc:613]
+    Network service crashed, restarting service.
+```
+
+根因是 chromium 的多进程架构用 `/proc/self/exe` 拉起 network service 子进程，
+而容器里 `/proc` 整棵前缀是**透传宿主**的（路径翻译层的设计，使 realpath /
+inotify 能在容器语义下工作），`/proc/self/exe` 解析出的目标不可 exec。
+`--no-zygote --single-process` 也无法绕过（network service 仍独立 spawn）。
+
+这不是依赖缺失，是**多进程 + 容器路径语义**的架构冲突。要解决需要给
+chromium 提供它期望的进程启动路径（例如把 `/proc/self/exe` 在容器内映射成
+真实可执行文件），属于专门适配，不在本轮范围。
+
+**AI 入口**
+
+```sh
+dshgui demo-list        # 列出已装/未装的图形软件
+dshgui demo netsurf     # 浏览器渲染本地页面
+dshgui demo geany       # IDE 打开 demo.c
+```
+
+`cmd_demo` 的三个设计约束（探针 `scripts/probes/_test_dshgui_demo.py` 22 条断言固定）：
+1. **未安装时给可操作提示**（`apk add <name>`）并返回退出码 3，不是静默失败
+2. **Xvfb 没起时自动拉起**，不要求调用方先手动 `dshgui start`
+3. 前置文件（`/tmp/site/index.html`、`/tmp/demo.c`）**只在不存在时创建**，
+   绝不覆盖用户改过的内容

@@ -17,6 +17,8 @@
 #   dshgui key <keysym>       注入按键（如 Return / ctrl+c）
 #
 # —— 虚拟机（QEMU）系列：把「手机里跑模拟器」也纳进同一个入口 ——
+#   dshgui demo-list              列出可演示的图形软件（已装/未装）
+#   dshgui demo <name>            启动一个真实的图形界面软件
 #   dshgui vm-start [--iso X] [--mem 768] [--vga std]
 #                             启动 QEMU 虚拟机（默认 linux-lts + bochs DRM）
 #   dshgui vm-stop            关掉虚拟机
@@ -388,6 +390,74 @@ cmd_vm_click() {
     echo "clicked $1,$2"
 }
 
+# ---- 真实图形界面软件演示 ----------------------------------------------
+# 为什么单独一组：xterm/xcalc 这类是「最小 X11 客户端」，只能证明 X 协议通；
+# NetSurf 与 Geany 是**真实桌面应用**（自带 HTML/CSS 引擎、GTK 控件树、
+# 语法高亮、符号解析），能证明字体栈、图标主题、GTK 主题、剪贴板、
+# 多窗口管理整条桌面链路都在工作。
+DEMO_KNOWN="netsurf geany xterm xcalc xeyes xclock"
+
+cmd_demo_list() {
+    echo "已装/未装的图形软件："
+    for b in $DEMO_KNOWN; do
+        if command -v "$b" >/dev/null 2>&1; then
+            echo "  [已装] $b"
+        else
+            echo "  [未装] $b"
+        fi
+    done
+}
+
+cmd_demo() {
+    name="${1:-}"
+    if [ -z "$name" ]; then
+        echo "用法: dshgui demo <netsurf|geany|xterm|xcalc|xeyes|xclock>" >&2
+        return 1
+    fi
+    command -v "$name" >/dev/null 2>&1 || {
+        echo "dshgui: $name 未安装（apk add $name）" >&2
+        return 3
+    }
+    # 确保 Xvfb 在跑
+    DISPLAY="$DISPLAY_ID" xdpyinfo >/dev/null 2>&1 || cmd_start 1280x800x24 >/dev/null
+
+    case "$name" in
+        netsurf)
+            # NetSurf 自带 HTML/CSS 引擎，喂一个本地页面最能体现渲染能力
+            [ -f /tmp/site/index.html ] || {
+                mkdir -p /tmp/site
+                cat > /tmp/site/index.html <<'EOH'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>DSH Demo</title>
+<style>
+body{font-family:sans-serif;background:#0b1220;color:#e2e8f0;padding:40px}
+h1{color:#38bdf8;font-size:40px}
+.box{background:#1e293b;border:2px solid #38bdf8;padding:20px;margin:16px 0;border-radius:10px}
+.hi{color:#f472b6;font-weight:bold}
+</style></head><body>
+<h1>Real browser, real rendering</h1>
+<div class="box">Rendered by <span class="hi">NetSurf</span> inside an Alpine container on Android.</div>
+</body></html>
+EOH
+            }
+            DISPLAY="$DISPLAY_ID" nohup netsurf file:///tmp/site/index.html >/tmp/dshgui_ns.log 2>&1 &
+            ;;
+        geany)
+            [ -f /tmp/demo.c ] || cat > /tmp/demo.c <<'EOC'
+#include <stdio.h>
+int fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }
+int main(void) { for (int i=0;i<12;i++) printf("fib(%d)=%d
+",i,fib(i)); return 0; }
+EOC
+            DISPLAY="$DISPLAY_ID" nohup geany --no-session /tmp/demo.c >/tmp/dshgui_gy.log 2>&1 &
+            ;;
+        *)
+            DISPLAY="$DISPLAY_ID" nohup "$name" >"/tmp/dshgui_$name.log" 2>&1 &
+            ;;
+    esac
+    sleep 6
+    cmd_windows
+}
+
 case "${1:-}" in
     start)   shift; cmd_start "$@" ;;
     stop)    shift; cmd_stop "$@" ;;
@@ -398,6 +468,8 @@ case "${1:-}" in
     click)   shift; cmd_click "$@" ;;
     type)    shift; cmd_type "$@" ;;
     key)     shift; cmd_key "$@" ;;
+    demo-list)  shift; cmd_demo_list "$@" ;;
+    demo)       shift; cmd_demo "$@" ;;
     vm-start)   shift; cmd_vm_start "$@" ;;
     vm-stop)    shift; cmd_vm_stop "$@" ;;
     vm-status)  shift; cmd_vm_status "$@" ;;

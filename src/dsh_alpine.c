@@ -295,6 +295,12 @@ static void ensure_rootfs_fd(void);  // fwd decl
 static volatile long g_hits, g_execs;
 // [prof] 按 syscall 号分桶计数（仅用于性能分析，编译后在退出时打印）
 static volatile long g_nr_cnt[512];
+// 守卫命中统计：重入守卫把某个 syscall 直接判成 -EPERM 的次数。
+// 正常情况恒为 0 —— 一旦非 0，说明外层 seccomp 拦了我们重发的某个
+// syscall（历史上依次是 poll(7)、select(23)、fork(57)，都已在上面
+// 翻译成 ppoll / pselect6 / clone）。进程退出时打到 stderr 的 [GUARD] 行。
+static volatile long g_guard_hits;
+static volatile long g_guard_nr[512];
 
 #if defined(DSH_ARCH_AARCH64)
 __attribute__((naked, noinline)) long raw6(long n, long a, long b, long c, long d, long e, long f) {
@@ -895,53 +901,9 @@ static int utoa_(char *d, unsigned long v) {
 // USER / LOGNAME 也一并丢掉，后果是 App 显式传进来的 `HOME=/dsh`、
 // `TMPDIR=/tmp` 被静默覆盖回 `/root`：登录 shell 读不到 /dsh 下的用户配置，
 // 引擎与终端看到的 HOME 与 App 预期不一致（实测 HOME=/root 而非 /dsh）。
-// 宿主环境里**不能带进容器**的变量。
-//
-// 判据是「值在容器里没有意义」，不是「名字敏感」：
-//   - PREFIX / ANDROID_* / BOOTCLASSPATH：Android 的路径，容器是 Alpine
-//   - SHELL：宿主的 /system/bin/sh 在容器里不存在，容器侧另行补 /bin/sh
-//   - TMPDIR / TMP / TEMP：宿主临时目录在容器里不存在（实测泄漏进去会让
-//     dsh-spill-local 的 mkdtemp 直接 ENOENT，插件 activate 失败）
-//
-// ★ LD_LIBRARY_PATH 与 LD_PRELOAD **不能无条件丢**。
-//   曾经它们在这个表里，理由是「宿主的库路径在容器里没意义」—— 对宿主自己
-//   传进来的值成立，但代码没有区分「主进程启动时继承的宿主值」与
-//   「用户在容器内 export 的值」，一律砍掉。
-//   后果（实测）：容器里 `export LD_LIBRARY_PATH=...然后再 exec` 的结果是
-//   **子进程拿不到这个变量**；而 Alpine 的 openjdk8/11/17/21 的 java 可执行
-//   文件 NEEDED libjli.so，靠 `$ORIGIN/../lib/amd64/jli` 的 RUNPATH 定位，
-//   我们的 loader 不展开 $ORIGIN（见 47 条同族的 48 条），于是只能靠
-//   LD_LIBRARY_PATH 兜底 —— 变量被砍就完全起不来。
-//   现在改为：**只丢「值看起来像 Android 宿主路径」的那一份**，
-//   容器内 export 的（值以 / 开头且不像宿主前缀）照常传递。
-static int looks_like_host_path(const char *v) {
-    static const char *pfx[] = {
-        "/data/", "/system/", "/system_ext/", "/product/", "/odm/",
-        "/vendor/", "/apex/", "/storage/emulated/", "/mnt/",
-    };
-    for (unsigned i = 0; i < sizeof(pfx) / sizeof(pfx[0]); i++) {
-        const char *p = pfx[i];
-        unsigned k = 0;
-        while (p[k] && v[k] == p[k]) k++;
-        if (!p[k]) return 1;
-    }
-    return 0;
-}
-
 static int env_drop_host(const char *e) {
-    // LD_LIBRARY_PATH / LD_PRELOAD：按值判断（见上）
-    {
-        static const char *ld[] = { "LD_LIBRARY_PATH", "LD_PRELOAD" };
-        for (unsigned i = 0; i < 2; i++) {
-            const char *b = ld[i];
-            unsigned k = 0;
-            while (b[k] && e[k] == b[k]) k++;
-            if (b[k] || e[k] != '=') continue;
-            return looks_like_host_path(e + k + 1) ? 1 : 0;
-        }
-    }
     static const char *bad[] = {
-        "PREFIX", "SHELL",
+        "PREFIX", "LD_LIBRARY_PATH", "LD_PRELOAD", "SHELL",
         "BOOTCLASSPATH", "ASEC_MOUNTPOINT", "EXTERNAL_STORAGE",
         "ANDROID_DATA", "ANDROID_ROOT", "ANDROID_STORAGE", "ANDROID_ART_ROOT",
         "ANDROID_I18N_ROOT", "ANDROID_TZDATA_ROOT", "ANDROID_RUNTIME_ROOT",
@@ -999,6 +961,38 @@ static int dns_proxy_port(void) {
         break;
     }
     return g_dns_port_cached;
+}
+
+// 诊断输出开关：环境里带 `DSH_TRAP_PROFILE=1` 时才把 [TRAPCNT] / [GUARD]
+// 统计写到 stderr。
+//
+// 为什么要有这个开关：这些行是**排查工具**，不是用户输出。原先无条件打印，
+// 于是扩展中心的装包进度窗里会混进一大片
+//     [TRAPCNT] total=...
+//     nr=14 c=13
+//     nr=264 c=938
+// 把真正的 apk/dpkg 报错挤到看不见的地方（实测装 OpenJDK 失败时，
+// 用户看到的第一屏全是 nr= 统计，真正的原因
+// `ERROR: java-common-1.0-r0.trigger: script exited with error 131`
+// 在最后一行才出现）。
+//
+// 默认关闭；排查「App 进程内某个 syscall 被外层 seccomp 拦掉」时，
+// 用 DSH_TRAP_PROFILE=1 起容器即可拿回全部统计。
+static int g_trap_profile_cached = -1;
+static int trap_profile_on(void) {
+    if (g_trap_profile_cached >= 0) return g_trap_profile_cached;
+    static const char key[] = "DSH_TRAP_PROFILE=";
+    unsigned kl = sizeof(key) - 1;
+    g_trap_profile_cached = 0;
+    for (int i = 0; i < g_env_count; i++) {
+        const char *e = g_env_store[i];
+        unsigned k = 0;
+        while (k < kl && e[k] && e[k] == key[k]) k++;
+        if (k != kl) continue;
+        const char *d = e + kl;
+        if (d[0] == (char)49) { g_trap_profile_cached = 1; break; }  // '1'
+    }
+    return g_trap_profile_cached;
 }
 
 static int env_has_(const char *name) {
@@ -1139,31 +1133,14 @@ static __attribute__((noinline)) void child_run_raw(long argc_dummy) {
     unsigned long ispan = ihi - ilo;
     (void)ispan;
     if (!guest_static) {
-        // 整段预留 anon RW（段间空隙为零页，可读写），随后文件映射覆盖文件部分。
-        //
-        // ★不能只靠 MAP_FIXED_NOREPLACE(0x100000)：它是 **Linux 4.17** 才有的标志。
-        //   老内核（实测 Android 模拟器 emulator-5554 是 **3.18.91**）不认识这个位，
-        //   会把它当「不认识的标志」忽略掉 —— 请求变成普通的 hint 型 mmap，
-        //   内核可以（也确实）返回**别的地址**，而下面 PT_LOAD 的 MAP_FIXED 与
-        //   慢路径的 pread64 全都按 IHI+ilo 这个绝对值来算 → 写进未映射区。
-        //   实测症状：mmap 返回 0x7e66ba588000（不是 0x7000000000），随后
-        //   `pread64(4, 0x70000a1aa0, 2404, 658080) = -1 EFAULT` → exit_group(131)
-        //   → 容器内所有需要 fork+exec 的操作（shell 跑任何外部命令、gcc 拉 cc1/as/ld）
-        //   全部静默失败。
-        //   修法：**必须校验返回地址 == 请求地址**，不等就用 MAP_FIXED 严格重来。
-        long want = (long)(IHI + ilo);
-        long rv = raw6(SYS_mmap, want, (long)ispan, 3 /*RW*/,
+        // 整段预留 anon RW（段间空隙为零页，可读写），随后文件映射覆盖文件部分
+        long rv = raw6(SYS_mmap, (long)(IHI + ilo), (long)ispan, 3 /*RW*/,
                        0x22 /*PRIVATE|ANON*/ | 0x100000 /*FIXED_NOREPLACE*/, -1, 0);
-        if (rv >= 0 && rv > -4096 && rv != want) {
-            // 内核给了别处：先撤掉这段「跑偏」的映射，再用 MAP_FIXED 严格落位
-            raw6(SYS_munmap, rv, (long)ispan, 0, 0, 0, 0);
-            rv = -1;
-        }
         if (rv < 0 && rv > -4096) {
-            rv = raw6(SYS_mmap, want, (long)ispan, 3 /*RW*/, 0x32 /*PRIVATE|ANON|FIXED*/, -1, 0);
+            raw6(SYS_munmap, (long)(IHI + ilo), (long)ispan, 0, 0, 0, 0);
+            rv = raw6(SYS_mmap, (long)(IHI + ilo), (long)ispan, 3, 0x32, -1, 0);
         }
         if (rv < 0 && rv > -4096) raw6(SYS_exit_group, 123, 0, 0, 0, 0, 0);
-        if (rv != want) raw6(SYS_exit_group, 123, 0, 0, 0, 0, 0);
     }
     if (!guest_static) {
         for (int i = 0; i < ieh->e_phnum; i++) {
@@ -1186,19 +1163,13 @@ static __attribute__((noinline)) void child_run_raw(long argc_dummy) {
     if (glo == ~0UL) raw6(SYS_exit_group, 122, 0, 0, 0, 0, 0);
     unsigned long gspan = ghi - glo;
     {
-        // 同上：FIXED_NOREPLACE 在 4.17 之前的内核上会被忽略，必须校验落位地址。
-        long gwant = (long)(GHI + glo);
-        long rv = raw6(SYS_mmap, gwant, (long)gspan, 3 /*RW*/,
+        long rv = raw6(SYS_mmap, (long)(GHI + glo), (long)gspan, 3 /*RW*/,
                        0x22 | 0x100000, -1, 0);
-        if (rv >= 0 && rv > -4096 && rv != gwant) {
-            raw6(SYS_munmap, rv, (long)gspan, 0, 0, 0, 0);
-            rv = -1;
-        }
         if (rv < 0 && rv > -4096) {
-            rv = raw6(SYS_mmap, gwant, (long)gspan, 3, 0x32 /*FIXED*/, -1, 0);
+            raw6(SYS_munmap, (long)(GHI + glo), (long)gspan, 0, 0, 0, 0);
+            rv = raw6(SYS_mmap, (long)(GHI + glo), (long)gspan, 3, 0x32, -1, 0);
         }
         if (rv < 0 && rv > -4096) raw6(SYS_exit_group, 121, 0, 0, 0, 0, 0);
-        if (rv != gwant) raw6(SYS_exit_group, 121, 0, 0, 0, 0, 0);
     }
     for (int i = 0; i < geh->e_phnum; i++) {
         if (gph[i].p_type != PT_LOAD) continue;
@@ -1652,6 +1623,179 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
     (void)info;
     ucontext_t *u = (ucontext_t *)uc;
     long nr = (long)r[8];
+    // ★★重入守卫（v1.6.17）：本次 trap 的 syscall 是**我们自己发的**吗？
+    //
+    //   机制：Android 会给每个 App 进程额外装一层 seccomp（zygote 里装的那层），
+    //   它只按 syscall 号判、不看调用者 IP。我们在 handler 里用 raw6 重发被 trap
+    //   的 syscall，指令地址落在 loader 段（0x2xxxxxxxx，我们自己的过滤器按 IP
+    //   白名单放行），但 Android 那层照样把它 trap —— 于是 SIGSYS 再投递一次，
+    //   handler 再进一层，无限递归，直到把 guest 栈压穿。
+    //
+    //   实测（模拟器 x86_64、App 进程内）：`DIAG recurse used=526504 nr=165`
+    //   （165=mount，栈已吃掉 526KB）。2MB 栈表现为 error 6（页不存在）；改成
+    //   8MB 后漂到 guest 只读段变成 error 7（页只读）—— 症状随栈大小漂移，
+    //   极易被误判成「栈太小」。shell / su / run-as 里 Seccomp 都是 0（没有
+    //   Android 那层），所以同一条命令在那里永远不复现，这正是「本地通、App 崩」
+    //   的由来。
+    //
+    //   判定用 **RIP 是否在 loader 段**，不用「同号 syscall 计数」：
+    //   全局计数在多线程下会把别的线程的正常 trap 误判成重入（实测 poll 被
+    //   误拒成 -EPERM，网络直接瘫痪）。IP 判定是纯粹无状态的、每信号自带，
+    //   不存在跨线程串味。
+    //
+    //   命中说明「这层重发必然再被外层拦」，直接给 guest 返回 -EPERM 而不重发。
+    //   mount 本来就该失败，-EPERM 是诚实的答案。
+#if defined(DSH_ARCH_AARCH64)
+    unsigned long trap_ip = (unsigned long)u->uc_mcontext.pc;
+#else
+    unsigned long trap_ip = (unsigned long)u->uc_mcontext.gregs[REG_RIP];
+#endif
+    if ((trap_ip >> 32) == (unsigned long)DSH_LOADER_BASE_HI) {
+        g_guard_hits++;
+        if (nr > 0 && nr < 512) g_guard_nr[nr]++;
+        r[0] = (unsigned long long)(long)-EPERM;
+        return;
+    }
+    // ★poll → ppoll（v1.6.17，必须放在最前面；仅 x86_64）。
+    //
+    //   Android 给 App 装的那层 seccomp 策略在 x86_64 上允许 ppoll(271)、
+    //   **禁止 poll(7)**。guest 里 musl 的 select()/poll() 在这套 ABI 上走
+    //   poll，于是每次都被外层拦；原样重发 → 再 trap → 无限递归（139 的
+    //   根因之一）。poll(fds,nfds,timeout_ms) 与 ppoll(fds,nfds,&ts,mask,siz)
+    //   等价：timeout<0 传 NULL（无限等），sigmask 传 NULL（不改掩码）。
+    //
+    //   放在 switch 之前：handler 中部有大量提前 return 的分支，靠后的位置
+    //   可能根本到不了（实测放尾部时 poll 仍被原样重发）。
+    //
+    //   ★只在 x86_64 编译：aarch64 的通用 ABI **没有 poll 这个 syscall**
+    //   （只有 ppoll=73），写进去会直接编译失败。
+#if defined(DSH_ARCH_X86_64)
+    if (nr == SYS_poll) {
+        struct { long tv_sec; long tv_nsec; } ts;
+        void *tsp = 0;
+        long to = (long)r[2];
+        if (to >= 0) {
+            ts.tv_sec = to / 1000;
+            ts.tv_nsec = (to % 1000) * 1000000L;
+            tsp = &ts;
+        }
+        r[0] = (unsigned long long)raw6(SYS_ppoll, (long)r[0], (long)r[1], (long)tsp, 0, 0, 0);
+        return;
+    }
+#endif
+    // ★select → pselect6（v1.7.x；仅 x86_64，与 poll 同源问题）。
+    //
+    //   实证（模拟器 x86_64、App 进程内、装 Python 扩展）：
+    //       [GUARD-EPERM] nr=23        ← 23 = select
+    //       fetch http://mirrors.aliyun.com/... 等满 30s 后
+    //       WARNING: updating and opening ...: IO ERROR
+    //   而 `apk update` 在 adb shell / su / run-as 里（Seccomp=0）秒过。
+    //
+    //   Android 给 App 进程装的那层 seccomp 只按 syscall 号判、不看 IP：
+    //   它放行 pselect6(270)，拦 select(23)。我们 handler 里通过 raw6 重发
+    //   select，指令地址虽然在 loader 段（自己的过滤器按 IP 白名单放行），
+    //   但外层照样 trap → 重入守卫命中 → guest 拿到 -EPERM。
+    //   apk 的 socket 等待循环拿不到可读事件，重试到超时，最终报 IO ERROR，
+    //   看起来像镜像站/网络问题，实际是 select 被拒。
+    //
+    //   语义对齐：select(nfds, r, w, e, &timeval) 与
+    //   pselect6(nfds, r, w, e, &timespec, NULL) 只差超时结构体
+    //   （timeval.tv_usec 微秒 vs timespec.tv_nsec 纳秒）。fd_set 布局完全相同，
+    //   nfds 的用途也相同。timeout 为 NULL 时原样传 NULL（无限等待）。
+    //
+    //   ★回写：select 的语义是「返回时把 timeval 改成剩余时间」，
+    //   pselect6 不改 timespec。所以调用后要把 ts 反算回 guest 的 timeval：
+    //   pselect6 不写它，于是值等于进来时的值 —— 即「没有消耗时间」。
+    //   对「等到了事件」的情形这是对的（剩余=原值不符，但调用方通常只看返回值）；
+    //   对超时返回 0 的情形显式写 0（时间确实耗尽），否则调用方会误以为
+    //   还有余量，重试时又等满一整轮。
+    //
+    //   ★只在 x86_64 编译：aarch64 的通用 ABI 没有 select 这个 syscall
+    //   （只有 pselect6=72 / ppoll=73），写进去会直接编译失败。
+#if defined(DSH_ARCH_X86_64)
+    if (nr == SYS_select) {
+        // 命名结构体（不能用匿名 struct：两处匿名类型互不兼容，
+        // clang 会报 incompatible pointer types）
+        struct dsh_timeval { long tv_sec; long tv_usec; };
+        struct dsh_timespec { long tv_sec; long tv_nsec; };
+        struct dsh_timespec ts;
+        struct dsh_timeval *tv = (struct dsh_timeval *)(unsigned long long)r[4];
+        void *tsp = 0;
+        if (tv) {
+            ts.tv_sec = tv->tv_sec;
+            ts.tv_nsec = tv->tv_usec * 1000L;
+            tsp = &ts;
+        }
+        long sel_r = raw6(SYS_pselect6, (long)r[0], (long)r[1], (long)r[2],
+                          (long)r[3], (long)tsp, 0);
+        if (tv && sel_r >= 0) {
+            // 超时耗尽 → 归零；有事件 → 保留原值（见上面的说明）
+            if (sel_r == 0) { tv->tv_sec = 0; tv->tv_usec = 0; }
+            else { tv->tv_sec = ts.tv_sec; tv->tv_usec = ts.tv_nsec / 1000L; }
+        }
+        r[0] = (unsigned long long)sel_r;
+        return;
+    }
+#endif
+    // ★fork → clone（v1.7.x；仅 x86_64，与 poll/select 同源问题）。
+    //
+    //   实证（模拟器 x86_64、App 进程内、装 Python 扩展）：装包成功，但
+    //   `[GUARD-EPERM] nr=57` 命中一次 —— 57 就是 x86_64 的 fork。
+    //   这次 apk 自己退回了 clone 所以没坏事，但**容器里任何 guest 调
+    //   fork() 都会拿到 EPERM**：musl 在 x86_64 上把 fork() 直接实现成
+    //   fork 系统调用（不像 glibc 走 clone），于是 shell 子进程、python
+    //   multiprocessing、`cmd &` 这类全都废掉。
+    //
+    //   Android 外层那层 seccomp 与拦 select 同一逻辑：按号拦、不看 IP。
+    //   翻译成 clone(SIGCHLD) 后走的是与现代 libc 完全等价的路径 ——
+    //   fork() 在 Linux 上本来就等价于 clone(SIGCHLD, ...)，
+    //   alembic 一样、语义一样（子进程不共享 VM、copy-on-write）。
+    //
+    //   ★只在 x86_64 编译：aarch64 通用 ABI 没有 fork 这个 syscall
+    //   （只有 clone=220），写进去会直接编译失败。
+#if defined(DSH_ARCH_X86_64)
+    if (nr == SYS_fork) {
+        r[0] = (unsigned long long)raw6(SYS_clone, 17 /*SIGCHLD*/, 0, 0, 0, 0, 0);
+        return;
+    }
+#endif
+    // ★dup2 → dup3（v1.7.x；仅 x86_64，与 poll/select/fork 同源问题）。
+    //
+    //   实证（模拟器 x86_64、App 进程内、装 nodejs 时 apk 的 post-install）：
+    //       dup2(12, 1) = 33                      ← guest 以为成功
+    //       --- SIGSYS {si_syscall=__NR_dup2} ---
+    //       rt_sigreturn(...) = -1 EPERM
+    //       line 3: dup2(12,1): Operation not permitted
+    //   随后 shell 在同一行反复重试，CPU 打满、apk 数据库锁一直被占，
+    //   界面上就是「一直转圈 / 一直加载中」，且后续 apk update 全报
+    //   Unable to lock database（rc=99）。
+    //
+    //   触发点是 apk 的 post-install 脚本：`cat >&2 <<EOF ... EOF` 里的
+    //   `>&2` 让 busybox sh 用 dup2 重定向 stdout。所以**任何带 heredoc
+    //   重定向的包脚本都会把整个装包流程卡死**。手写 `echo` 不涉及 dup2，
+    //   这也是早期「手工跑 trigger 一切正常」具误导性的原因。
+    //
+    //   Android 外层 seccomp 放行 dup3(292)、拦 dup2(33)，同样只看号不看 IP。
+    //   语义对齐：dup2(old, new) 与 dup3(old, new, 0) 完全等价 ——
+    //   dup3 多的第三个参数是 flags，传 0 就没有 O_CLOEXEC，行为与 dup2 一致
+    //   （包括 old == new 时 dup2 返回 new 而不关闭，dup3 则返回 EINVAL；
+    //   这里按 dup2 语义特判：old == new 且 old 是有效 fd 时直接返回 new）。
+    //
+    //   ★只在 x86_64 编译：aarch64 通用 ABI 没有 dup2（只有 dup3=24）。
+#if defined(DSH_ARCH_X86_64)
+    if (nr == SYS_dup2) {
+        int d_old = (int)r[0], d_new = (int)r[1];
+        // dup2 的特殊语义：oldfd == newfd 时若 oldfd 有效则原样返回，不关闭
+        if (d_old == d_new) {
+            long f = raw6(SYS_fcntl, d_old, 1 /*F_GETFD*/, 0, 0, 0, 0);
+            r[0] = (f < 0) ? (unsigned long long)(-EBADF)
+                           : (unsigned long long)d_new;
+        } else {
+            r[0] = (unsigned long long)raw6(SYS_dup3, d_old, d_new, 0, 0, 0, 0);
+        }
+        return;
+    }
+#endif
     long a0 = (long)(int)(unsigned int)r[0];
     unsigned long long a1 = r[1], a2 = r[2], a3 = r[3], a4 = r[4], a5 = r[5];
     // ★自愈：guest 可能用 pthread_sigmask 把 SIGSYS 阻塞掉（nginx/postgres 这类
@@ -1801,8 +1945,31 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
             //   —— 实测容器内 `export PATH=...` 对子进程完全无效，ccache 永远不生效。
             static char **gve;
             gve = genvp;
-            raw6(SYS_execveat, self, (long)"", (long)fullargv, (long)gve, 0x1000, 0);
-            // execveat 失败 → 退回 fork 路径，不能把 guest 进程杀掉
+            long exr = raw6(SYS_execveat, self, (long)"", (long)fullargv, (long)gve, 0x1000, 0);
+            // ★execveat 被外层 seccomp 拦时应退回 execve（v1.7.x）。
+            //
+            //   实测（模拟器 x86_64、App 进程内、`sh -c "/bin/busybox echo HI"`）：
+            //       [EXEC] reexec self_fd=6
+            //       [EXEC] execveat_rc=38        ← 38 = ENOSYS
+            //       RC=131
+            //   即容器里**嵌套执行的子进程**在重执行自身时 execveat 直接 ENOSYS。
+            //   后果不只是慢：重执行失败后退回 fallback_fork，而那时本进程的
+            //   .data 段已按「马上要 exec 掉」的假设清理过，child_run_raw 拿不到
+            //   guest 参数 → 子进程静默退出 131（128+3 = SIGQUIT）。
+            //
+            //   这就是容器里所有 `sh -c "外部命令"`、以及 apk 的 trigger 脚本
+            //   （busybox/ca-certificates/java-common 都用 /bin/sh 起）报
+            //   `script exited with error 131` 的根因 —— 与宿主/权限/网络无关，
+            //   改动前的旧产物同样复现，是长期既有的 bug。
+            //
+            //   Android 的 zygote 层 seccomp 与本文件里 select(23)、fork(57)
+            //   那两次完全同源：放行 execve，拦 execveat(322)。
+            //   退回用 execve("/proc/self/exe", ...) 语义完全等价
+            //   （execveat + AT_EMPTY_PATH 就是它的 fd 版），且 /proc 一定可读。
+            if (exr < 0 && (exr == -38 || exr == -1 || exr == -13)) {
+                raw6(SYS_execve, (long)"/proc/self/exe", (long)fullargv, (long)gve, 0, 0, 0);
+            }
+            // execveat/execve 都失败 → 退回 fork 路径，不能把 guest 进程杀掉
             raw6(SYS_close, self, 0, 0, 0, 0, 0);
         }
     fallback_fork:
@@ -1816,8 +1983,9 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
             }
             int status = 0;
             if (pid > 0) raw6(SYS_wait4, pid, (long)&status, 0, 0, 0, 0);
-            // [prof] 打印按 syscall 号排序的 trap 统计（写到 stderr，只在本进程）
-            {
+            // [prof] 打印按 syscall 号排序的 trap 统计（写到 stderr，只在本进程）。
+            // ★默认关闭（见 trap_profile_on()）：这些行会污染用户的装包日志。
+            if (trap_profile_on()) {
                 char lb[256];
                 int k = 0;
                 const char *pfx = "[TRAPCNT] total=";
@@ -1834,6 +2002,29 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
                     m += utoa_(lb + m, (unsigned long)g_nr_cnt[i]);
                     lb[m++] = 10;
                     raw6(SYS_write, 2, (long)lb, m, 0, 0, 0);
+                }
+            }
+            // 守卫命中统计（同样只在 DSH_TRAP_PROFILE=1 时输出）。
+            // 非 0 说明外层 seccomp 拦了我们重发的某个 syscall —— 历史上依次是
+            // poll(7)、select(23)、fork(57)，都已在 handler 前段翻译成
+            // ppoll / pselect6 / clone。
+            if (g_guard_hits && trap_profile_on()) {
+                char gb[256];
+                int gk = 0;
+                const char *gpfx = "[GUARD] total=";
+                while (*gpfx) gb[gk++] = *gpfx++;
+                gk += utoa_(gb + gk, (unsigned long)g_guard_hits);
+                gb[gk++] = 10;
+                raw6(SYS_write, 2, (long)gb, gk, 0, 0, 0);
+                for (int i = 0; i < 512; i++) {
+                    if (!g_guard_nr[i]) continue;
+                    int gm = 0;
+                    gb[gm++] = 'n'; gb[gm++] = 'r'; gb[gm++] = '=';
+                    gm += utoa_(gb + gm, (unsigned long)i);
+                    gb[gm++] = ' '; gb[gm++] = 'c'; gb[gm++] = '=';
+                    gm += utoa_(gb + gm, (unsigned long)g_guard_nr[i]);
+                    gb[gm++] = 10;
+                    raw6(SYS_write, 2, (long)gb, gm, 0, 0, 0);
                 }
             }
             raw6(SYS_exit_group, (long)((status >> 8) & 0xFF), 0, 0, 0, 0, 0);
@@ -1878,39 +2069,29 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
             r[0] = (unsigned long long)raw6(nr, (long)lp, a1, a2, a3, a4, a5);
             return;
         }
-        // ★ /proc/self/exe 必须在 dev_passthrough **之前**处理。
+        // ★readlink("/proc/self/exe") 必须在 dev_passthrough 之前拦下。
         //
-        //   为什么：/proc 整棵前缀是透传给宿主内核的（dev_passthrough 命中），
-        //   而宿主内核按**宿主进程**解析 /proc/self/exe，返回的必然是加载器
-        //   自己的路径（实测 /data/local/tmp/ax）。任何靠它推 $ORIGIN 的程序
-        //   都会算错自己的安装位置。
+        //   /proc 整棵前缀是透传给宿主的，于是老式 readlink 原样转发给内核，
+        //   内核按**宿主进程**解析，返回 loader 自己的宿主路径
+        //       /data/data/app.dsh.mobile/files/linux/runner/dsh_alpine
+        //   而 guest 期待的是它自己那条路径。
         //
-        //   实测后果（Alpine 的 openjdk8/11/17/21 全部起不来）：
-        //     readlink("/proc/self/exe") -> /data/local/tmp/ax
-        //     -> JRE 根算成 /data/local/tmp
-        //     -> Error: could not find libjava.so
-        //     -> Could not find Java SE Runtime Environment
-        //   而 java 二进制本身是好的（清单正常、ldd 全解析），报错完全指向
-        //   「JRE 装坏了」这个错误方向。
+        //   后果（实测装完 openjdk17 后 `java -version`）：
+        //       Error loading shared library libjli.so: No such file or directory
+        //       Error relocating ...: JLI_Launch: symbol not found
+        //   java 的 RPATH 是 `$ORIGIN:$ORIGIN/../lib`，musl 解析 $ORIGIN 时会
+        //   readlink(/proc/self/exe) 取自身路径 —— 拿到 loader 的宿主路径后拼出
+        //   `/data/.../runner/../lib`，libjli.so 自然找不到。所有依赖 $ORIGIN
+        //   的二进制（java、node 的某些发行版、带 RPATH 的第三方程序）全废。
         //
-        //   readlinkat 分支早就处理了这两种情况，但**老式 readlink 没有**
-        //   —— x86_64 保留了这个无 dirfd 的老接口，而 musl 的 readlink() 走的
-        //   正是它（strace 实证：si_syscall=__NR_readlink）。
+        //   readlinkat 分支早有这个特判（见下面单路径 *at 段的
+        //   is_proc_self_exe），但 x86_64 独有的老式 readlink 漏了 ——
+        //   而 musl 在 x86_64 上正是用 readlink(89) 而不是 readlinkat。
         if (nr == SYS_readlink && is_proc_self_exe(lp)) {
             int n = 0;
             while (g_guest_path[n] && n < (int)a2 - 1) n++;
             for (int i = 0; i < n; i++) ((char *)a1)[i] = g_guest_path[i];
             r[0] = (unsigned long long)n;
-            return;
-        }
-        if (nr == SYS_readlink && is_proc_self_fd(lp)) {
-            long rvf = raw6(SYS_readlinkat, -100, (long)lp,
-                            (long)a1, (long)a2, 0, 0);
-            if (rvf > 0) {
-                int n2 = host_to_guest((char *)a1, (int)rvf);
-                if (n2 >= 0) rvf = n2;
-            }
-            r[0] = (unsigned long long)rvf;
             return;
         }
         if (dev_passthrough(lp)) {
@@ -1999,9 +2180,6 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
                                             (long)a1, (long)a2, 0, 0);
             return;
         case SYS_readlink:
-            // /proc/self/exe 与 /proc/<pid>/exe 已在进入本 switch **之前**
-            // 就拦掉了（dev_passthrough 会把整个 /proc 透传走，所以那段必须
-            // 放在透传判断之前 —— 这里只剩普通路径的情况）。
             r[0] = (unsigned long long)raw6(SYS_readlinkat, lfd, (long)lbuf,
                                             (long)a1, (long)a2, 0, 0);
             return;
@@ -2532,33 +2710,6 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
             r[0] = 0;
             return;
         }
-        // 非 SIGSYS 的 rt_sigaction：必须把 sa_mask 里的 SIGSYS 位抠掉。
-        //
-        // 为什么：seccomp 的 SIGSYS 要靠我们的 handler 接住再把控制权交回去。
-        // 任何程序只要在**自己的** handler 里屏蔽了 SIGSYS（JVM 就是典型 ——
-        // 它给 SIGSEGV/SIGBUS 装的 handler 带 `[ILL TRAP BUS FPE SEGV]` 掩码，
-        // 部分路径会把 SIGSYS 也带上），那之后每一次被 TRAP 的 syscall 都会
-        // 变成「信号投递不出去 → 内核按默认动作杀掉进程」：
-        //     --- SIGSYS {si_syscall=__NR_rt_sigprocmask} ---
-        //     +++ killed by SIGSYS +++
-        // 表现是 `Bad system call`，且**完全看不出与我们有关**。
-        //
-        // 修法与 rt_sigprocmask 那条一致：静默剔除这一位，guest 拿到 0
-        // 以为设置成功，实际永远屏蔽不住 SIGSYS。
-        {
-            // x86_64 kernel struct sigaction: handler(0) flags(8) restorer(16) mask(24)
-            unsigned long *sa = (unsigned long *)(uintptr_t)a1;
-            if (sa) {
-                unsigned long m = sa[3];
-                if (m & (1UL << (31 - 1))) {
-                    unsigned long cp[4];
-                    cp[0] = sa[0]; cp[1] = sa[1]; cp[2] = sa[2];
-                    cp[3] = m & ~(1UL << (31 - 1));
-                    r[0] = (unsigned long long)raw6(nr, a0, (long)cp, a2, a3, a4, a5);
-                    return;
-                }
-            }
-        }
         r[0] = (unsigned long long)raw6(nr, a0, a1, a2, a3, a4, a5);
         return;
     }
@@ -2744,11 +2895,25 @@ static void sigsys_impl(siginfo_t *info, void *uc, unsigned long long *r) {
             if (bind_map(np, nh)) { nfd = -100; np = nh; }
             else { make_rel(nbuf, np); nfd = g_rootfs_fd; n_rel = 1; }
         }
-        r[0] = (unsigned long long)raw6(nr, ofd,
-                                        o_rel ? (long)ob : (long)op,
-                                        nfd,
-                                        n_rel ? (long)nbuf : (long)np,
-                                        (long)a4, 0);
+        long rrr = raw6(nr, ofd,
+                        o_rel ? (long)ob : (long)op,
+                        nfd,
+                        n_rel ? (long)nbuf : (long)np,
+                        (long)a4, 0);
+        if (rrr < 0 && trap_profile_on()) {
+            char db[192]; int dk=0;
+            const char *dp="[RENAME] nr="; while(*dp) db[dk++]=*dp++;
+            dk += utoa_(db+dk, (unsigned long)(nr==SYS_renameat2?316UL:264UL));
+            dp=" rc="; while(*dp) db[dk++]=*dp++;
+            dk += utoa_(db+dk, (unsigned long)(long)(-rrr));
+            dp=" ofd="; while(*dp) db[dk++]=*dp++;
+            dk += utoa_(db+dk, (unsigned long)(long)(ofd<0?999999UL:(unsigned long)ofd));
+            dp=" nfd="; while(*dp) db[dk++]=*dp++;
+            dk += utoa_(db+dk, (unsigned long)(long)(nfd<0?999999UL:(unsigned long)nfd));
+            db[dk++]=10;
+            raw6(SYS_write, 2, (long)db, dk, 0, 0, 0);
+        }
+        r[0] = (unsigned long long)rrr;
         return;
     }
     default:

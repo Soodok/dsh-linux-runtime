@@ -139,8 +139,16 @@ def main():
     ok("g_cleaner_namelen = plen;" in body, "B3 恢复 g_cleaner_namelen")
 
     print("[C] cleaner_exec 入口守卫不变")
-    ok(re.search(r"if \(!g_cleaner_on \|\| g_cleaner_pid <= 0\) return -1;", src) is not None,
-       "C1 两个条件都在（这正是 B2 必要的原因）")
+    # ★2026-11-09 修正一条**陈旧断言**（不是放宽门限）：
+    #   原断言钉死老写法 `if (!g_cleaner_on || g_cleaner_pid <= 0) return -1;`，
+    #   而实现后来**加严**成三个条件（多了 g_cleaner_namelen —— 只恢复 on/pid、
+    #   namelen 仍为 0 时照样连不上 socket）。所以红的是断言本身，不是代码。
+    #   改判据时同时收紧了方向：断言「namelen 这条也必须在」—— 将来谁删掉任何
+    #   一条放松守卫，这里都会变红。
+    guard = re.search(r"if \(!g_cleaner_on \|\| g_cleaner_pid <= 0([^)]*)\)", src)
+    ok(guard is not None, "C1 找到 cleaner_exec 的入口守卫")
+    ok("g_cleaner_namelen" in (guard.group(1) if guard else ""),
+       "C2 守卫同时要求 g_cleaner_namelen（只恢复 on/pid 仍连不上 socket）")
 
     print("[E] cleaner 必须常驻（能连续服务多次请求）")
     ok(re.search(r"static void cleaner_loop[^}]*for \(;;\) \{", src, re.S) is not None,

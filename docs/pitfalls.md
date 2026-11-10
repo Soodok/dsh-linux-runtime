@@ -2931,3 +2931,91 @@ $ WLR_BACKENDS=libinput sway
 - ✅ 不能只看「命令 rc=0」，要看**目标程序的状态真的变了**（帧里出现新文字）
 - ✅ 坐标要精确对应（内容窗口偏移 10 像素这种细节也要对上）
 - ✅ 注入后必须**抓一帧看图**，不能只看进程数量或日志
+
+## #66 「回到前台就重连」不能靠探活判断 —— 探活测的是服务端，坏的是那条 socket
+
+### 症状
+
+App 在后台放久了再切回来，WebUI 里所有进度停住、消息发不出去。去连接列表点
+一下「恢复连接」立刻正常。而且那条「没发出去」的消息其实**已经发出去了** ——
+服务端早就收到。
+
+### 根因
+
+Android 把后台进程冻结（cgroup `frozen`）时，**整个进程连同子进程一起挂起**：
+WebView 的 JS 线程和引擎的 node 进程都不再运行。冻结期间内核仍然保持着那条
+TCP（**不发 FIN**），但没有任何一方去读写它 → 连接进入**半开**状态：两端都
+认为还连着，谁也收不到对方的数据。
+
+解冻后：
+- 服务端推的增量全丢 → 进度停住；
+- 发消息走 WebSocket 那条路静默失败；
+- 但前端发消息还有一条 HTTP 兜底路径，那条真的通 → **消息发出去了**。
+
+前端不会自己恢复：`@deepseek-ai/dsh-client-connection` 有完整指数退避
+（`backoffBaseMs=500` / `backoffFactor=2` / `backoffMaxMs=10000`）和
+`watchBrowserNetwork()`，但它**只监听 `online`/`offline`**。实测
+`lib/client.browser.js`（60601 字节）里 `visibilitychange` 出现 **0 次**；
+解冻不改变网络状态，所以 `online` 不触发。更糟的是**半开时
+`WebSocket.readyState` 仍是 OPEN**，所以连退避都不会开始。
+
+### ★ 第一版设计错在哪（必须记下来）
+
+我的第一版判据是：解冻后 `HEAD /` 探活，服务端活着且 `state === "connected"`
+就判定健康、不重连。
+
+**实测当场否证**：`lastReconnectAt` 恒为 0、`generationId` 恒为 1，从未重连。
+
+```
+冻结后 diag: {state: 'connected', generationId: 1, lastReconnectAt: 0}
+HEAD / → 200          ← 引擎也一起解冻了，服务端是活的
+→ 我的判据：健康 → 不重连（永远）
+```
+
+探活对这个故障**毫无鉴别力**：它测的是「服务端是否在运行」，而出问题的是
+「这条 socket 是否还有效」。服务端好好的，socket 死了。想真正测 socket 得
+往里写业务数据（污染），或者等引擎自己超时（10 秒起步），都不合适。
+
+### 正确判据：后台停留时长
+
+| 后台时长 | 处理 |
+|---|---|
+| < 10 秒 | 探活兜底：服务端不应答才重连；应答且 state 正常就放过（不白刷界面） |
+| ≥ 10 秒 | **不探活，直接 `connection.reconnect()`** |
+
+10 秒偏保守（cached→frozen 通常在数十秒后，但厂商差异大）：宁可多重连一次，
+不要让用户卡住。长时重连的代价 = 页面重新拉一次快照（会话列表、插件列表…），
+与用户手动点「恢复连接」完全相同 —— 而那次点击是被验证有效的。
+
+### 实现要点
+
+- 插件 `app/src/main/assets/android-plugins/resume-reconnect/`，`inject = ["connection"]`
+- 暴露 `window.__dshResume(elapsedMs)`，App 侧 `MainActivity.onResume` 传入
+  `onPause` 到 `onResume` 的毫秒数（用 `SystemClock.elapsedRealtime()`，
+  不是 `currentTimeMillis` —— 后者会被改时间影响）
+- 插件自己也监听 `visibilitychange` / `pageshow`，覆盖浏览器切标签页 / bfcache
+- 两处都调是幂等的：`reconnect()` 首句 `if (!this.running) return`，内部
+  `abort(MANUAL_RECONNECT)` 打断退避并把 `attempt` 归零
+- 为什么不在前端改：`dsh-client-connection` 属上游，改会被升级覆盖；
+  而且「后台待了多久」只有 Activity 知道得最准（冻结时网页事件可能不投递）
+
+### 验证判据：`generation.id` 而不是 `state`
+
+`generation.id` 是引擎每次**连接成功**时 `++generationId` 的单调计数，它变了
+⇔ 真的新建过一条连接。`state` 在半开时本来就是骗人的。
+
+| 场景 | 判据 | 结果 |
+|---|---|---|
+| 手工 `SIGSTOP` 引擎 → 调钩子 → `SIGCONT` | `generationId` | **1 → 2**，`reason: forced` |
+| 对照组：同样 `SIGSTOP`/`SIGCONT` 但不调钩子 | `generationId` | 2 → 2（不变，证明变化来自钩子） |
+| **真实用户路径**：按 Home 待 15 秒 → 切回 | `generationId` | **2 → 3**，`why: host-resume`、`reason: forced` |
+| 对照：按 Home 只待 3 秒 → 切回 | `lastDecision.reason` | `healthy-skip`，`generationId` 不变 |
+
+### 教训
+
+- **探活证明不了「这条连接还活着」**。它证明的是「对端进程还在跑」。
+  半开是 TCP 层的问题，只有真正往里写数据才能发现。
+- 判断「有没有真的重连」要用**单调递增的计数**（`generation.id`），不要用
+  枚举型状态（`state`）—— 后者恰恰是 bug 伪装的地方。
+- 反向验证要**带对照组**：同一个 `SIGSTOP`/`SIGCONT` 不调钩子时 generation
+  必须不变，否则说明有别的东西在替你重连，主结论就不干净了。
